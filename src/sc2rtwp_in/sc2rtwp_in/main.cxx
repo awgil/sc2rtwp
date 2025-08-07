@@ -8,6 +8,7 @@ import injected.logger;
 import injected.hooker;
 import injected.app;
 import injected.debug.veh;
+import injected.debug.delayed_crash;
 import injected.game.slowmode;
 
 void logHashDiff(u64 index, u32* table, u32 hash, u32 expected)
@@ -25,68 +26,6 @@ void patchHashDiff(char* imagebase, u64 diffFoundRVA, u64 jumpRVA)
 	memcpy(imagebase + diffFoundRVA, hashPatch, sizeof(hashPatch));
 	*(u32*)(imagebase + diffFoundRVA + sizeof(hashPatch)) = jumpRVA - diffFoundRVA - sizeof(hashPatch) - 4;
 	*(void**)(imagebase + diffFoundRVA + sizeof(hashPatch) + 4) = logHashDiff;
-}
-
-u64 imagebase = 0;
-void decodeAntidebug(u64& a1, u64& a2)
-{
-	const u64 c = 0xF3791823EBD0BA08;
-	a2 = std::rotr(c, 12) - a2;
-	a1 ^= ~imagebase ^ c;
-}
-
-struct AntidebugCrash
-{
-	u64 f0;
-	u64 crashTick;
-	u64 f10;
-	u32 f18;
-	u32 reason;
-	u64 f20;
-	u64 f28;
-};
-//bool operator!=(const AntidebugCrash& l, const AntidebugCrash& r) { return memcmp(&l, &r, sizeof(AntidebugCrash)) != 0; }
-bool operator!=(const AntidebugCrash& l, const AntidebugCrash& r) { return memcmp(&l.f0 + 1, &r.f0 + 1, sizeof(AntidebugCrash) - 8) != 0; } // ignore f0, it just changes all the time..
-
-u64* xorredCrashState = nullptr;
-AntidebugCrash getCrashState()
-{
-	AntidebugCrash res = {};
-	auto outPtr = &res.f0;
-	u64 h1 = 0x96478FAEECCF46AE, h2 = xorredCrashState[6];
-	decodeAntidebug(h1, h2);
-	for (int i = 0; i < 6; ++i)
-	{
-		outPtr[i] = xorredCrashState[i] ^ (std::rotr(h1, 11) - h2);
-		h1 = std::rotr(xorredCrashState[i], 11) - h2;
-	}
-	return res;
-}
-
-AntidebugCrash lastCrash = {};
-int tickId = 0;
-bool updateLastCrash()
-{
-	auto tickIndex = tickId++;
-	auto prevCrash = lastCrash;
-	lastCrash = getCrashState();
-	if (lastCrash != prevCrash)
-	{
-		Log::msg("Crash changed at frame {}: at {} (in {} ms), reason={}, fields={:016X} {:016X} {:08X} {:016X} {:016X}", tickIndex, lastCrash.crashTick, (int)(lastCrash.crashTick - GetTickCount()), lastCrash.reason, lastCrash.f0, lastCrash.f10, lastCrash.f18, lastCrash.f20, lastCrash.f28);
-	}
-	return false;
-}
-
-void checkCrashState(void* spinlock)
-{
-	if (*reinterpret_cast<u32*>(spinlock) != 0)
-		return; // just entered spinlock, wait
-	auto state = getCrashState();
-	if (state.reason != lastCrash.reason)
-	{
-		Log::msg("Starting to crash");
-		Log::stack();
-	}
 }
 
 void* roundToPage(void* ptr)
@@ -129,30 +68,25 @@ void processTriggerHook(u32 id)
 void init()
 {
 	auto& app = App::instance();
-	Log::msg("Hello from injected; imagebase = {}", static_cast<void*>(app.hooker().imagebase()));
+	Log::msg("Hello from injected; imagebase = {}", static_cast<void*>(app.imagebase()));
 	app.installHooks();
 
-	auto& debugVEH = DebugVEH::instance();
-	debugVEH.install();
+	// debug stuff - should be possible to disable completely and still run this
+	app.addTickCallback(protectStack);
+	DebugVEH::instance().install();
+	DebugDelayedCrash::instance().installTickMonitor();
+	DebugDelayedCrash::instance().installChangeMonitor();
 
 	auto& hookAlloc = app.hooker();
 
 	// TODO: this is an imagebase from from the dump i've been using for reversing; replace with sigs...
 	const auto segbase = 0x7FF6AE4D0000;
 
-	imagebase = (u64)hookAlloc.imagebase();
-	xorredCrashState = (u64*)(imagebase + (0x7FF6B1EC07F8 - segbase));
-	updateLastCrash();
-	debugVEH.setWriteBreakpoint(xorredCrashState + 7, checkCrashState); // set on spinlock
-
-	app.addTickCallback(protectStack);
-	app.addTickCallback(updateLastCrash);
-
 	// skip hash checks
-	auto antidebugState = *(char**)(imagebase + (0x7FF6B1EBEFC8 - segbase));
+	auto antidebugState = *(char**)(hookAlloc.imagebase() + (0x7FF6B1EBEFC8 - segbase));
 	auto& xorredNumPageHashes = *(u32*)(antidebugState + 0x100);
 	auto nphKey1 = 0x255A95D456AE37AA;
-	auto nphKey2 = *(u64*)(imagebase + (0x7FF6B1EC0216 - segbase));
+	auto nphKey2 = *(u64*)(hookAlloc.imagebase() + (0x7FF6B1EC0216 - segbase));
 	auto nphKey = nphKey1 - std::rotr(nphKey2, 12);
 	Log::msg("Num hashed pages = {:X} == {:X} ^ ({:X} - ({:X} >>> 12))", xorredNumPageHashes ^ nphKey, xorredNumPageHashes, nphKey1, nphKey2);
 	xorredNumPageHashes = 1 ^ nphKey;
@@ -162,7 +96,7 @@ void init()
 	//*(uint16_t*)(curbase +0x15BAA10) = 0x9090;
 
 	// avoid segment checks: replace first two (code and data) with last one
-	u64* antidebugSegment = (u64*)(imagebase + (0x7FF6AE597AE4 - segbase));
+	u64* antidebugSegment = (u64*)(hookAlloc.imagebase() + (0x7FF6AE597AE4 - segbase));
 	antidebugSegment[0] = antidebugSegment[3] = antidebugSegment[12];
 	antidebugSegment[1] = antidebugSegment[4] = antidebugSegment[13];
 	antidebugSegment[2] = antidebugSegment[5] = antidebugSegment[14];
