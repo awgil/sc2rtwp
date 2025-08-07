@@ -1,13 +1,11 @@
-//module;
-
 #include <common/win_headers.h>
-#include <malloc.h>
 
 import common;
 import injected.logger;
 import injected.hooker;
 import injected.app;
 import injected.debug.veh;
+import injected.debug.stack_protect;
 import injected.debug.delayed_crash;
 import injected.game.slowmode;
 
@@ -28,38 +26,6 @@ void patchHashDiff(char* imagebase, u64 diffFoundRVA, u64 jumpRVA)
 	*(void**)(imagebase + diffFoundRVA + sizeof(hashPatch) + 4) = logHashDiff;
 }
 
-void* roundToPage(void* ptr)
-{
-	return (void*)((u64)ptr & ~0xFFF);
-}
-
-void protectPage(void* ptr, DWORD protection, int npages = 1)
-{
-	DWORD old;
-	auto res = VirtualProtect(roundToPage(ptr), 4096 * npages, protection, &old);
-	if (!res)
-		Log::msg("Failed to set protection for {}: {}", ptr, GetLastError());
-}
-
-void growStack(int extraPages)
-{
-	auto origStackLimit = NtCurrentTeb()->Reserved1[2];
-	do {
-		alloca(4096);
-	} while (NtCurrentTeb()->Reserved1[2] == origStackLimit || extraPages--);
-}
-
-bool protectStack()
-{
-	auto origStackLimit = NtCurrentTeb()->Reserved1[2];
-	Log::msg("Trying to protect stack for thread {}: {}", GetCurrentThreadId(), origStackLimit);
-	growStack(4);
-	auto currStackLimit = NtCurrentTeb()->Reserved1[2];
-	protectPage(currStackLimit, PAGE_READONLY, 5);
-	Log::msg("Protect stack: orig={}, curr={}, end={}", origStackLimit, currStackLimit, NtCurrentTeb()->Reserved1[1]);
-	return true;
-}
-
 void processTriggerHook(u32 id)
 {
 	Log::msg("Trigger: {}", id);
@@ -72,8 +38,8 @@ void init()
 	app.installHooks();
 
 	// debug stuff - should be possible to disable completely and still run this
-	app.addTickCallback(protectStack);
 	DebugVEH::instance().install();
+	DebugStackProtect::instance().installMainThread();
 	DebugDelayedCrash::instance().installTickMonitor();
 	DebugDelayedCrash::instance().installChangeMonitor();
 

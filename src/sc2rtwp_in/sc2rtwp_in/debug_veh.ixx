@@ -7,7 +7,6 @@ export module injected.debug.veh;
 import std;
 import common;
 import injected.logger;
-import injected.hooker;
 
 // debug utility that registers a veh callback and monitors any exceptions
 // in addition, it provides a makeshift memory breakpoint utility (implemented by setting page protections)

@@ -69,15 +69,6 @@ public:
 		mKeybinds[key] = std::move(action);
 	}
 
-	// various anti-debug utilities use this transformation as part of its obfuscation process
-	// it's symmetrical - calling it twice is identity transformation
-	void decodeAntidebug(u64& a1, u64& a2)
-	{
-		const u64 c = 0xF3791823EBD0BA08;
-		a2 = std::rotr(c, 12) - a2;
-		a1 ^= ~reinterpret_cast<u64>(imagebase()) ^ c;
-	}
-
 private:
 	App() : mHooker(ensure(GetModuleHandleA(nullptr))) {}
 
