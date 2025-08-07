@@ -20,16 +20,18 @@ import common;
 class ProtectSection : Nonmovable
 {
 public:
-	ProtectSection(const Process& process, void* address, u32 protection)
+	ProtectSection(const Process& process, void* address, u32 protection, bool temporary = true)
 		: mProc(process)
 		, mInfo(process.queryMemoryInfo(address))
+		, mTemporary(temporary)
 	{
 		mProc.remapMemory(mInfo.BaseAddress, mInfo.RegionSize, protection);
 	}
 
 	~ProtectSection()
 	{
-		mProc.protectMemory(mInfo.BaseAddress, mInfo.RegionSize, mInfo.Protect);
+		if (mTemporary)
+			mProc.protectMemory(mInfo.BaseAddress, mInfo.RegionSize, mInfo.Protect);
 	}
 
 	const auto& info() const { return mInfo; }
@@ -38,6 +40,7 @@ public:
 private:
 	const Process& mProc;
 	MEMORY_BASIC_INFORMATION mInfo;
+	bool mTemporary;
 };
 
 class SuppressTLS : Nonmovable
@@ -138,7 +141,7 @@ int main(int argc, char* argv[])
 	suspend.suspendAll(proc);
 
 	ProtectSection code{ proc, hprimary, PAGE_EXECUTE_READWRITE };
-	ProtectSection data{ proc, code.sectionEnd(), PAGE_READWRITE };
+	ProtectSection data{ proc, code.sectionEnd(), PAGE_READWRITE, false }; // this is needed only for breakpoints...
 	SuppressTLS suppressTls{ proc, hprimary };
 
 	// patching...

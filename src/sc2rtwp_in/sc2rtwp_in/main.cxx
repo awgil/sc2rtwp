@@ -6,13 +6,15 @@
 import common;
 import injected.logger;
 import injected.hooker;
-import injected.rtwp;
+import injected.app;
+import injected.debug.veh;
+import injected.game.slowmode;
 
 void logHashDiff(u64 index, u32* table, u32 hash, u32 expected)
 {
 	auto& entry = table[1 + 2 * index];
 	auto hash_const = expected ^ entry;
-	Logger::log("hash difference found at #{:X} + {:X}: current={:08X}, expected={:08X}, hashed_expected={:08X}, hash_const={:08X}, f0={:08X}, e0={:08X}, table={}", index, 0x1000, hash, expected, entry, hash_const, table[0], table[1], static_cast<void*>(table));
+	Log::msg("hash difference found at #{:X} + {:X}: current={:08X}, expected={:08X}, hashed_expected={:08X}, hash_const={:08X}, f0={:08X}, e0={:08X}, table={}", index, 0x1000, hash, expected, entry, hash_const, table[0], table[1], static_cast<void*>(table));
 	entry = hash ^ hash_const;
 }
 
@@ -62,25 +64,28 @@ AntidebugCrash getCrashState()
 }
 
 AntidebugCrash lastCrash = {};
-void updateLastCrash(int tickIndex)
+int tickId = 0;
+bool updateLastCrash()
 {
+	auto tickIndex = tickId++;
 	auto prevCrash = lastCrash;
 	lastCrash = getCrashState();
 	if (lastCrash != prevCrash)
 	{
-		Logger::log("Crash changed at frame {}: at {} (in {} ms), reason={}, fields={:016X} {:016X} {:08X} {:016X} {:016X}", tickIndex, lastCrash.crashTick, (int)(lastCrash.crashTick - GetTickCount()), lastCrash.reason, lastCrash.f0, lastCrash.f10, lastCrash.f18, lastCrash.f20, lastCrash.f28);
+		Log::msg("Crash changed at frame {}: at {} (in {} ms), reason={}, fields={:016X} {:016X} {:08X} {:016X} {:016X}", tickIndex, lastCrash.crashTick, (int)(lastCrash.crashTick - GetTickCount()), lastCrash.reason, lastCrash.f0, lastCrash.f10, lastCrash.f18, lastCrash.f20, lastCrash.f28);
 	}
+	return false;
 }
 
-void checkCrashState()
+void checkCrashState(void* spinlock)
 {
-	if (*(u32*)(xorredCrashState + 7) != 0)
+	if (*reinterpret_cast<u32*>(spinlock) != 0)
 		return; // just entered spinlock, wait
 	auto state = getCrashState();
 	if (state.reason != lastCrash.reason)
 	{
-		Logger::log("Starting to crash");
-		Logger::stack();
+		Log::msg("Starting to crash");
+		Log::stack();
 	}
 }
 
@@ -94,7 +99,7 @@ void protectPage(void* ptr, DWORD protection, int npages = 1)
 	DWORD old;
 	auto res = VirtualProtect(roundToPage(ptr), 4096 * npages, protection, &old);
 	if (!res)
-		Logger::log("Failed to set protection for {}: {}", ptr, GetLastError());
+		Log::msg("Failed to set protection for {}: {}", ptr, GetLastError());
 }
 
 void growStack(int extraPages)
@@ -105,124 +110,51 @@ void growStack(int extraPages)
 	} while (NtCurrentTeb()->Reserved1[2] == origStackLimit || extraPages--);
 }
 
-void protectStack()
+bool protectStack()
 {
 	auto origStackLimit = NtCurrentTeb()->Reserved1[2];
-	Logger::log("Trying to protect stack for thread {}: {}", GetCurrentThreadId(), origStackLimit);
+	Log::msg("Trying to protect stack for thread {}: {}", GetCurrentThreadId(), origStackLimit);
 	growStack(4);
 	auto currStackLimit = NtCurrentTeb()->Reserved1[2];
 	protectPage(currStackLimit, PAGE_READONLY, 5);
-	Logger::log("Protect stack: orig={}, curr={}, end={}", origStackLimit, currStackLimit, NtCurrentTeb()->Reserved1[1]);
-}
-
-int tickId = 0;
-bool tickOnce = false;
-void preTick()
-{
-	if (!tickOnce)
-	{
-		tickOnce = true;
-		protectStack();
-	}
-
-	++tickId;
-	updateLastCrash(tickId);
-}
-
-bool (*tickOrig)() = nullptr;
-bool tickHook()
-{
-	preTick();
-	return tickOrig();
-}
-
-void* breakpoint = nullptr;
-bool runBreakpointLogic = false;
-void* singleStepVEH = nullptr;
-LONG vehHandlerSingleStep(_EXCEPTION_POINTERS* ExceptionInfo)
-{
-	if (ExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP)
-	{
-		//log("Expected single-step: %s", runBreakpointLogic ? "watched" : "irrelevant");
-		if (runBreakpointLogic)
-			checkCrashState();
-		protectPage(breakpoint, PAGE_READONLY);
-		runBreakpointLogic = false;
-		RemoveVectoredExceptionHandler(singleStepVEH);
-		singleStepVEH = nullptr;
-		return EXCEPTION_CONTINUE_EXECUTION;
-	}
-	return EXCEPTION_CONTINUE_SEARCH;
-}
-
-LONG vehHandler(_EXCEPTION_POINTERS* ExceptionInfo)
-{
-	switch (ExceptionInfo->ExceptionRecord->ExceptionCode)
-	{
-	case EXCEPTION_ACCESS_VIOLATION:
-	{
-		auto rw = ExceptionInfo->ExceptionRecord->ExceptionInformation[0];
-		auto addr = (void*)ExceptionInfo->ExceptionRecord->ExceptionInformation[1];
-		if (rw == 1 && roundToPage(addr) == roundToPage(breakpoint))
-		{
-			runBreakpointLogic = addr == breakpoint;
-			//log("Ghetto breakpoint: %s", runBreakpointLogic ? "watched" : "irrelevant");
-			protectPage(addr, PAGE_READWRITE);
-			ExceptionInfo->ContextRecord->EFlags |= 0x100; // enable single-step
-			singleStepVEH = AddVectoredExceptionHandler(true, vehHandlerSingleStep); // add handler to the front, to ensure it's called first
-			return EXCEPTION_CONTINUE_EXECUTION;
-		}
-		else
-		{
-			Logger::exception("veh av", ExceptionInfo);
-			return EXCEPTION_CONTINUE_SEARCH;
-		}
-	}
-	case EXCEPTION_BREAKPOINT:
-		return EXCEPTION_CONTINUE_SEARCH; // this happens routinely with antidebug, not interesting
-	default:
-		Logger::exception("veh", ExceptionInfo);
-		return EXCEPTION_CONTINUE_SEARCH;
-	}
-}
-
-void setGhettoBreakpoint(void* bp)
-{
-	breakpoint = bp;
-	protectPage(bp, PAGE_READONLY);
+	Log::msg("Protect stack: orig={}, curr={}, end={}", origStackLimit, currStackLimit, NtCurrentTeb()->Reserved1[1]);
+	return true;
 }
 
 void processTriggerHook(u32 id)
 {
-	Logger::log("Trigger: {}", id);
+	Log::msg("Trigger: {}", id);
 }
 
 void init()
 {
-	Logger::log("Hello from injected");
+	auto& app = App::instance();
+	Log::msg("Hello from injected; imagebase = {}", static_cast<void*>(app.hooker().imagebase()));
+	app.installHooks();
 
-	const auto curbase = (char*)ensure(GetModuleHandleA(nullptr));
+	auto& debugVEH = DebugVEH::instance();
+	debugVEH.install();
+
+	auto& hookAlloc = app.hooker();
+
+	// TODO: this is an imagebase from from the dump i've been using for reversing; replace with sigs...
 	const auto segbase = 0x7FF6AE4D0000;
 
-	Hooker hookAlloc;
+	imagebase = (u64)hookAlloc.imagebase();
+	xorredCrashState = (u64*)(imagebase + (0x7FF6B1EC07F8 - segbase));
+	updateLastCrash();
+	debugVEH.setWriteBreakpoint(xorredCrashState + 7, checkCrashState); // set on spinlock
 
-	imagebase = (u64)curbase;
-	xorredCrashState = (u64*)(curbase + (0x7FF6B1EC07F8 - segbase));
-	updateLastCrash(0);
-	setGhettoBreakpoint(xorredCrashState + 7); // set on spinlock
-
-	AddVectoredExceptionHandler(true, vehHandler);
-
-	// hook main tick function
-	tickOrig = hookAlloc.hook(curbase + (0x7FF6AFA8F4B0 - segbase), 0x13, tickHook);
+	app.addTickCallback(protectStack);
+	app.addTickCallback(updateLastCrash);
 
 	// skip hash checks
-	auto antidebugState = *(char**)(curbase + (0x7FF6B1EBEFC8 - segbase));
+	auto antidebugState = *(char**)(imagebase + (0x7FF6B1EBEFC8 - segbase));
 	auto& xorredNumPageHashes = *(u32*)(antidebugState + 0x100);
 	auto nphKey1 = 0x255A95D456AE37AA;
-	auto nphKey2 = *(u64*)(curbase + (0x7FF6B1EC0216 - segbase));
+	auto nphKey2 = *(u64*)(imagebase + (0x7FF6B1EC0216 - segbase));
 	auto nphKey = nphKey1 - std::rotr(nphKey2, 12);
-	Logger::log("Num hashed pages = {:X} == {:X} ^ ({:X} - ({:X} >>> 12))", xorredNumPageHashes ^ nphKey, xorredNumPageHashes, nphKey1, nphKey2);
+	Log::msg("Num hashed pages = {:X} == {:X} ^ ({:X} - ({:X} >>> 12))", xorredNumPageHashes ^ nphKey, xorredNumPageHashes, nphKey1, nphKey2);
 	xorredNumPageHashes = 1 ^ nphKey;
 
 	//patchHashDiff(curbase, 0x15BAA80, 0x15BB54F);
@@ -230,16 +162,16 @@ void init()
 	//*(uint16_t*)(curbase +0x15BAA10) = 0x9090;
 
 	// avoid segment checks: replace first two (code and data) with last one
-	u64* antidebugSegment = (u64*)(curbase + (0x7FF6AE597AE4 - segbase));
+	u64* antidebugSegment = (u64*)(imagebase + (0x7FF6AE597AE4 - segbase));
 	antidebugSegment[0] = antidebugSegment[3] = antidebugSegment[12];
 	antidebugSegment[1] = antidebugSegment[4] = antidebugSegment[13];
 	antidebugSegment[2] = antidebugSegment[5] = antidebugSegment[14];
 
 	// skip checks in the antidebug thread, which validate tampering for antidebug state and pagehash map
 	if (*(u32*)(antidebugState + 0xE80))
-		Logger::log("Warning: bad time to inject, antidebug thread is mid pagehash checks...");
-	Hooker::patchJumpToUnconditional(curbase + (0x7FF6AE6D6C63 - segbase)); // page hash
-	Hooker::patchJumpToUnconditional(curbase + (0x7FF6AE6D721E - segbase)); // state hash
+		Log::msg("Warning: bad time to inject, antidebug thread is mid pagehash checks...");
+	Hooker::patchJumpToUnconditional(hookAlloc.imagebase() + (0x7FF6AE6D6C63 - segbase)); // page hash
+	Hooker::patchJumpToUnconditional(hookAlloc.imagebase() + (0x7FF6AE6D721E - segbase)); // state hash
 
 	// hook switch-case on process trigger
 	// here we have a large junk region right after call (so we don't have to preserve volatile registers); r13d contains id
@@ -250,7 +182,8 @@ void init()
 	//*(u32*)(processTriggerJumpFrom + sizeof(processTriggerPatch) - 4) = processTriggerJumpTo - processTriggerJumpFrom - sizeof(processTriggerPatch);
 	//*(void**)(processTriggerJumpFrom + sizeof(processTriggerPatch)) = processTriggerHook;
 
-	installRTWP(hookAlloc, curbase);
+	GameSlowmode::install(app);
+	Log::msg("Injection done, resuming game...");
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)

@@ -11,21 +11,31 @@ import injected.logger;
 export class Hooker
 {
 public:
+	Hooker(HMODULE module) : mImagebase(reinterpret_cast<char*>(module)) {}
+
+	char* imagebase() const { return mImagebase; }
+
 	char* alloc(size_t size)
 	{
-		if (m_free + size > m_limit)
+		if (mFree + size > mLimit)
 		{
-			m_free = static_cast<char*>(VirtualMemoryBlock(65536, PAGE_EXECUTE_READWRITE).leak());
-			m_limit = m_free + 65536;
+			mFree = static_cast<char*>(VirtualMemoryBlock(65536, PAGE_EXECUTE_READWRITE).leak());
+			mLimit = mFree + 65536;
 		}
-		auto ptr = m_free;
-		m_free = ptr + size;
+		auto ptr = mFree;
+		mFree = ptr + size;
 		return ptr;
 	}
 
-	// relocLen has to be >= 14
-	template<typename T> T* hook(char* func, size_t relocLen, T* detour)
+	template<typename T> void assign(u64 rva, T*& outPtr) const
 	{
+		outPtr = reinterpret_cast<T*>(mImagebase + rva);
+	}
+
+	// relocLen has to be >= 14
+	template<typename T> T* hook(u64 rva, size_t relocLen, T* detour)
+	{
+		auto* func = mImagebase + rva;
 		auto* original = alloc(relocLen + 6 + 8); // jmp [rip+0] + ptr
 		memcpy(original, func, relocLen);
 		*reinterpret_cast<u16*>(original + relocLen) = 0x25FF;
@@ -51,11 +61,12 @@ public:
 		}
 		else
 		{
-			Logger::log("Failed to patch jump at {}: {:02X}", address, address[0]);
+			Log::msg("Failed to patch jump at {}: {:02X}", address, address[0]);
 		}
 	}
 
 private:
-	char* m_free = nullptr;
-	char* m_limit = nullptr;
+	char* mImagebase = nullptr;
+	char* mFree = nullptr;
+	char* mLimit = nullptr;
 };

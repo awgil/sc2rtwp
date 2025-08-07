@@ -49,6 +49,13 @@ public:
 		return meminfo;
 	}
 
+	static u32 protectMemoryFor(void* address, u32 protection, size_t size = 4096, HANDLE handle = INVALID_HANDLE_VALUE)
+	{
+		DWORD prev = 0;
+		ensure(VirtualProtectEx(handle, address, size, protection, &prev));
+		return prev;
+	}
+
 	Process() = default; // default-constructed process with id=0 represents a null state
 
 	Process(u32 id)
@@ -167,8 +174,7 @@ public:
 
 	void protectMemory(void* address, size_t size, u32 protection) const
 	{
-		DWORD prev = 0;
-		ensure(VirtualProtectEx(mHandle, address, size, protection, &prev));
+		protectMemoryFor(address, protection, size, mHandle);
 	}
 
 	void remapMemory(void* address, size_t size, u32 protection) const
