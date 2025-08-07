@@ -47,8 +47,9 @@ public:
 		return reinterpret_cast<T*>(original);
 	}
 
-	static void patchJumpToUnconditional(char* address)
+	void patchJumpToUnconditional(u64 rva)
 	{
+		auto* address = mImagebase + rva;
 		if ((address[0] & 0xF0) == 0x70)
 		{
 			// near

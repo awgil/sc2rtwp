@@ -31,7 +31,7 @@ public:
 
 	void installChangeMonitor()
 	{
-		DebugVEH::instance().setWriteBreakpoint(&AntitamperAccess::instance().staticData()->delayedCrashSpinlock, [this](void* spinlock) {
+		DebugVEH::instance().setWriteBreakpoint(&AntitamperAccess::instance().state()->delayedCrashSpinlock, [this](void* spinlock) {
 			if (*reinterpret_cast<u32*>(spinlock) != 0)
 				return; // just entered spinlock, wait
 			auto state = AntitamperAccess::instance().decodeDelayedCrashState();

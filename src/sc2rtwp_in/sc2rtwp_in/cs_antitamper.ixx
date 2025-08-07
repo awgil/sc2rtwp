@@ -20,10 +20,14 @@ export struct DelayedCrashState
 };
 
 // heap-allocated part of the antitamper state
-// fields are all encoded, the algorithm is hardcoded everywhere it's accessed and uses some hardcoded constants - won't be surprised if they are different in every build
+// most fields are encoded, the algorithm is hardcoded everywhere it's accessed and uses some hardcoded constants - won't be surprised if they are different in every build
 export struct AntitamperDynamic
 {
+	inline u32& numPageHashes() { return field<u32>(0x100); }
+	inline u32& pageHashCheckSpinlock() { return field<u32>(0xE80); }
 
+private:
+	template<typename T> T& field(u64 offset) { return *reinterpret_cast<T*>(reinterpret_cast<char*>(this) + offset); }
 };
 
 // the main structure describing everything related to anti-tamper measures
@@ -56,6 +60,15 @@ export struct AntitamperStatic
 };
 static_assert(sizeof(AntitamperStatic) == 0x1878);
 
+// SC2 stores the expected results of VirtualQuery for all 5 mapped segments
+// all fields are encrypted
+export struct SegmentState
+{
+	u64 baseRVA;
+	u64 regionSize;
+	u64 protection;
+};
+
 export class AntitamperAccess
 {
 public:
@@ -65,17 +78,32 @@ public:
 		return inst;
 	}
 
-	AntitamperStatic* staticData() const { return mPtr; }
+	AntitamperStatic* state() const { return mPtr; }
+	SegmentState* segments() const { return mSegments; }
 
 	// various anti-tamper utilities use this transformation as part of its obfuscation process
 	// it's symmetrical - calling it twice is identity transformation
-	void obfuscate(u64& a1, u64& a2)
+	void obfuscate(u64& a1, u64& a2) const
 	{
 		a2 = mObfuscation2 - a2;
 		a1 ^= mObfuscation1;
 	}
 
-	DelayedCrashState decodeDelayedCrashState()
+	u64 xorConstant(u32 offset) const
+	{
+		return *reinterpret_cast<u64*>(mPtr->xorConstants + offset);
+	}
+
+	// AntitamperDynamic::numPageHashes is xorred with value returned by this function
+	u32 numPageHashesXorKey() const
+	{
+		auto c1 = 0x255A95D456AE37AAull;
+		auto c2 = xorConstant(0xA26);
+		auto h = c1 - std::rotr(c2, 12);
+		return static_cast<u32>(h);
+	}
+
+	DelayedCrashState decodeDelayedCrashState() const
 	{
 		DelayedCrashState res = {};
 		auto outPtr = &res.f0;
@@ -95,6 +123,7 @@ private:
 		// TODO: robust lookup method - maybe use TLS callback?..
 		auto& hooker = App::instance().hooker();
 		hooker.assign(0x39EEFC0, mPtr);
+		hooker.assign(0xC7AE4, mSegments);
 
 		const u64 c = 0xF3791823EBD0BA08;
 		mObfuscation1 = ~reinterpret_cast<u64>(hooker.imagebase()) ^ c;
@@ -103,6 +132,7 @@ private:
 
 private:
 	AntitamperStatic* mPtr;
+	SegmentState* mSegments;
 	u64 mObfuscation1 = 0;
 	u64 mObfuscation2 = 0;
 };

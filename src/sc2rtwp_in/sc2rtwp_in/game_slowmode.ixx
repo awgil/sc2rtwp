@@ -84,27 +84,27 @@ private:
 export class GameSlowmode
 {
 public:
-	static void install(App& app)
-	{
-		auto& inst = instance();
-		app.hooker().assign(0x5694230, inst.pTiming); // timing structure is in .data segment
-		app.hooker().assign(0x6841C0, inst.pfnTimingDataSetSpeed);
-		//hooker.hook(0x1557580, 0, inst.replGetSpeedForSetting1); // doing this fucks up mission timer for some reason
-		inst.oriGetSpeedForSetting2 = app.hooker().hook(0x15575E0, 0xE, hookGetSpeedForSetting2);
-
-		app.addKeybind({ VK_CAPITAL }, [&inst]() { inst.toggle(1024); }); // caps lock
-		app.addKeybind({ VK_SPACE }, [&inst]() { inst.toggle(256); });
-
-		inst.log();
-	}
-
-private:
 	static GameSlowmode& instance()
 	{
 		static GameSlowmode inst;
 		return inst;
 	}
 
+	void install()
+	{
+		auto& app = App::instance();
+		app.hooker().assign(0x5694230, pTiming); // timing structure is in .data segment
+		app.hooker().assign(0x6841C0, pfnTimingDataSetSpeed);
+		//hooker.hook(0x1557580, 0, inst.replGetSpeedForSetting1); // doing this fucks up mission timer for some reason
+		oriGetSpeedForSetting2 = app.hooker().hook(0x15575E0, 0xE, hookGetSpeedForSetting2);
+
+		app.addKeybind({ VK_CAPITAL }, [this]() { toggle(1024); }); // caps lock
+		app.addKeybind({ VK_SPACE }, [this]() { toggle(256); });
+
+		log();
+	}
+
+private:
 	void toggle(int speed)
 	{
 		mForcedSpeed = mForcedSpeed == speed ? 0 : speed;
