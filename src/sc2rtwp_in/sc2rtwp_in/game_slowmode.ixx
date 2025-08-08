@@ -9,6 +9,7 @@ import common;
 import injected.logger;
 import injected.hooker;
 import injected.app;
+import injected.cs.timingdata;
 
 // this mirrors default implementation in game
 int speedForSetting(int setting)
@@ -94,12 +95,11 @@ public:
 	{
 		auto& app = App::instance();
 		app.hooker().assign(0x5694230, pTiming); // timing structure is in .data segment
-		app.hooker().assign(0x6841C0, pfnTimingDataSetSpeed);
 		//hooker.hook(0x1557580, 0, inst.replGetSpeedForSetting1); // doing this fucks up mission timer for some reason
 		oriGetSpeedForSetting2 = app.hooker().hook(0x15575E0, 0xE, hookGetSpeedForSetting2);
 
 		app.addKeybind({ VK_CAPITAL }, [this]() { toggle(1024); }); // caps lock
-		app.addKeybind({ VK_SPACE }, [this]() { toggle(256); });
+		//app.addKeybind({ VK_SPACE }, [this]() { toggle(256); });
 
 		log();
 	}
@@ -110,7 +110,7 @@ private:
 		mForcedSpeed = mForcedSpeed == speed ? 0 : speed;
 		Log::msg("Changing forced speed to {}", mForcedSpeed);
 		auto actualSpeed = mForcedSpeed ? mForcedSpeed : speedForSetting(pTiming->speedIndex());
-		pfnTimingDataSetSpeed(actualSpeed);
+		TimingData::setGameSpeed(actualSpeed);
 		pTiming->setSpeed(actualSpeed, false);
 	}
 
@@ -124,7 +124,6 @@ private:
 private:
 	// game interop
 	Timing* pTiming = nullptr;
-	void (*pfnTimingDataSetSpeed)(int speed) = nullptr;
 
 	// this is awkward to hook
 	//static int* replGetSpeedForSetting1(int* out, int setting)

@@ -27,9 +27,25 @@ public:
 		return ptr;
 	}
 
+	template<typename T> T* get(u64 rva) const
+	{
+		return reinterpret_cast<T*>(mImagebase + rva);
+	}
+
 	template<typename T> void assign(u64 rva, T*& outPtr) const
 	{
-		outPtr = reinterpret_cast<T*>(mImagebase + rva);
+		outPtr = get<T>(rva);
+	}
+
+	template<typename T> T* getRipRelative(u64 nextInstructionRVA) const
+	{
+		auto offset = *reinterpret_cast<i32*>(mImagebase + nextInstructionRVA - 4);
+		return reinterpret_cast<T*>(mImagebase + nextInstructionRVA + offset);
+	}
+
+	template<typename T> void assignRipRelative(u64 nextInstructionRVA, T*& outPtr) const
+	{
+		outPtr = getRipRelative<T>(nextInstructionRVA);
 	}
 
 	// relocLen has to be >= 14

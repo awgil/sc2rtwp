@@ -10,6 +10,7 @@ import injected.debug.stack_protect;
 import injected.debug.delayed_crash;
 import injected.debug.trigger_ids;
 import injected.game.slowmode;
+import injected.game.rtwp;
 
 void init()
 {
@@ -25,10 +26,10 @@ void init()
 	DebugStackProtect::instance().installMainThread();
 	DebugDelayedCrash::instance().installTickMonitor();
 	DebugDelayedCrash::instance().installChangeMonitor();
-
-	DebugTriggerIds::instance().install();
+	//DebugTriggerIds::instance().install();
 
 	GameSlowmode::instance().install();
+	GameRTWP::instance().install();
 	Log::msg("Injection done, resuming game...");
 }
 
