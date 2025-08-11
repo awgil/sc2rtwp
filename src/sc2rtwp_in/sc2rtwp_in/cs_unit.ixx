@@ -8,7 +8,7 @@ import injected.app;
 export struct Unit
 {
 	u32 id; // low 18 bits are version, remaining 14 bits are index (4 low bits are offset within page, 10 high are page index)
-	char unk1[0x70];
+	char unk1[0x70]; // 0x1C/0x20: encoded x/y
 	i32 curSpeedX; // fixed point (<<12)
 	i32 curSpeedY; // fixed point
 	char unk2[0x1E4];
