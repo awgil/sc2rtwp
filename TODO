@@ -1,0 +1,4 @@
+- more careful injection to avoid intermittent crashes
+- sig scanner implementation
+- replace all hardcoded RVAs with sigs
+- update to latest patch
