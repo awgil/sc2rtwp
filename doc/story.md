@@ -604,6 +604,16 @@ There are only two issues now:
 
 The first one is easy to solve - just iterate over active timers and fix them, as if they are paused.
 
-The second is not fixed yet - it's just a cosmetic issue, however.
+The second one is a bit trickier. To start off, there's a trigger action to set unit position, which can be done immediately or with blend - let's see what calling immediate version right as I pause does to the issue.
+Finding the function is easy (using trigger action dispatch hook described above). The function accepts new position and blend flag, and has two branches depending on the blend flag - let's investigate what I'll call `Unit::setPositionImmediate`.
+
+I'll need to pass a new position there - and ideally I'd just pass current position, but I need to decode it first. Quick search doesn't find a function that simply returns a decoded position (understandable, it would be hilarious otherwise).
+There's however another function that calculates distance from unit to point - let's just butcher it, by patching out the distance calculation bit at the end and simply returning position, then call it for a hardcoded unit #1 while injecting, log out position, and patch back.
+After that is done, I know what to set - and then just hardcode set-position for unit #1 to known coordinates on pause. Trying it out - I can see that the interpolation stops. Ok, I'm on the right track.
+
+Now let's find what exactly is responsible for stopping the interpolation. It can't be position change (we don't actually change it), but `setPositionImmediate` does a whole bunch of extra stuff.
+So I do the really stupid hack now - I create a new function that does the same preamble (allocating stack frame, saving registers etc) and then jumps into the middle of `setPositionImmediate`. And then do a few attempts, changing the jump target, to see what's responsible for stopping the interpolation.
+
+This quickly gets me a candidate - let's call it `Unit::stopInterpolation`. Now, let's call it for all units on pause - and it works. Yay!
 
 And that concludes the effort.
