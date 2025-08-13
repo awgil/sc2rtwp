@@ -11,6 +11,7 @@ import injected.hooker;
 import injected.app;
 import injected.cs.timingdata;
 import injected.cs.scriptvar;
+import injected.cs.unit;
 
 // SC2 deals with timing in a somewhat weird way:
 // - every frame, it converts real time into game time (scaled by game speed), accumulates it, and whenever it reaches a threshold, executes simulation tick
@@ -81,6 +82,16 @@ private:
 		{
 			Log::msg("Pausing at {}", tick);
 			mPauseAtTick = tick;
+
+			auto& units = UnitLookup::instance();
+			for (u32 i = 0; i < units.manager()->maxIndex; ++i)
+			{
+				auto unit = units.findUnit(i);
+				if (unit && (unit->id >> 18) == i)
+				{
+					units.cancelMovementInterpolation(unit);
+				}
+			}
 		}
 	}
 

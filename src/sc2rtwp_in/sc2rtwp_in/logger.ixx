@@ -51,6 +51,28 @@ public:
 		stack();
 	}
 
+	static void dump(void* address, u64 size)
+	{
+		if (auto& inst = instance())
+		{
+			auto p = inst.mBuffer;
+			auto dump = [&](bool cond) {
+				if (cond && p != inst.mBuffer)
+				{
+					*p = 0;
+					inst.logRaw(p - inst.mBuffer);
+					p = inst.mBuffer;
+				}
+			};
+			for (u64 i = 0; i < size; ++i)
+			{
+				dump((i & 0xF) == 0);
+				p = std::format_to(p, "{:02X} ", reinterpret_cast<unsigned char*>(address)[i]);
+			}
+			dump(true);
+		}
+	}
+
 private:
 	static Log& instance()
 	{

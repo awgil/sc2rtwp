@@ -39,6 +39,11 @@ public:
 		return mFindUnit(mManager, index);
 	}
 
+	void cancelMovementInterpolation(Unit* unit)
+	{
+		mUnitStopInterpolation(unit);
+	}
+
 	void dump() const
 	{
 		Log::msg("Unit dump: {}/{}", mManager->f0, mManager->maxIndex);
@@ -55,9 +60,11 @@ private:
 		auto& hooker = App::instance().hooker();
 		hooker.assign(0x3B80B40, mManager);
 		hooker.assign(0x6603D0, mFindUnit);
+		hooker.assign(0x861210, mUnitStopInterpolation);
 	}
 
 private:
 	UnitManager* mManager;
 	Unit* (*mFindUnit)(UnitManager*, u32) = nullptr;
+	void (*mUnitStopInterpolation)(Unit*) = nullptr;
 };
