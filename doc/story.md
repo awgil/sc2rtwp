@@ -617,3 +617,25 @@ So I do the really stupid hack now - I create a new function that does the same 
 This quickly gets me a candidate - let's call it `Unit::stopInterpolation`. Now, let's call it for all units on pause - and it works. Yay!
 
 And that concludes the effort.
+
+## Not so fast!
+
+Ok, now that I have everything working, I can finally play the game! Booting up Mass Recall map... and it crashes again.
+
+This is another delayed crash, now with a new reason 320, haven't seen this one before. I have a stack, so I know what function sets up the delayed state. It also has all jump chains patched, so F5 works immediately. Let's see what it does.
+
+First is the already familiar manual GetTickCount implementation, followed by decoding `AntidebugState` field 0x818, which contains address of a real `GetTickCount64` function. The code calls it, compares the results, and crashes immediately if it's bigger than 7.5s.
+Neat, but irrelevant for me.
+
+After that it does something interesting (containing the block that sets 320 delayed crash), and finally it has a copy of the delayed-crash handling code I've already seen in main tick function.
+Let's look at the interesting block. It's rate limited to 5% frames, and then has an extra check - even if it detects tampering, it only actually sets the delayed crash state if hash of the process id satisfies a 50% check. Ok, this probably explains why I didn't see it before - got lucky with process ids.
+
+The actual tampering check:
+* Decodes two fields from `AntidebugState` (0x570 and 0x578). These both are some pointers, former to somewhere in code section (which doesn't seem to contain code), latter to some heap block.
+* Generates a random index < 4095, reads a byte from first buffer, adds a random value to a byte in second buffer, compares the value in the first buffer with what it read before, and then restores original value in the second buffer.
+* The crash block is executed only if comparison was true.
+
+Both buffers look identical. So it seems that the code checks whether write into second also affects first - i.e. expects both pages to be mapped into same memory.
+I did remap the code section before, so that I can inject - this explains why whatever custom mappings they've had are now broken.
+
+Let's just patch out the change. Of course, I could also restore the mappings - or even better, just change one of the fields so that they decode to same pointer - but that would require replicating the encoding logic. That's more work, let's do that only if I find that the check is duplicated in multiple places.

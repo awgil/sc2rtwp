@@ -7,6 +7,7 @@ export module injected.debug.veh;
 import std;
 import common;
 import injected.logger;
+import injected.app;
 
 // debug utility that registers a veh callback and monitors any exceptions
 // in addition, it provides a makeshift memory breakpoint utility (implemented by setting page protections)
@@ -114,6 +115,12 @@ private:
 		return true;
 	}
 
+	static bool isKnownHarmlessUD2Address(i64 rva)
+	{
+		return rva == 0x154a6af // this one checks whether any bits in dr7 are set
+			|| rva == 0x20eb06; // this one is done by TLS callback for any new threads
+	}
+
 	static LONG vehHandler(_EXCEPTION_POINTERS* ExceptionInfo)
 	{
 		switch (ExceptionInfo->ExceptionRecord->ExceptionCode)
@@ -143,6 +150,13 @@ private:
 				return EXCEPTION_CONTINUE_SEARCH;
 			}
 		}
+		case EXCEPTION_ILLEGAL_INSTRUCTION:
+			// ignore if coming from one of the known-harmless places
+			if (!isKnownHarmlessUD2Address(reinterpret_cast<char*>(ExceptionInfo->ExceptionRecord->ExceptionAddress) - App::instance().imagebase()))
+			{
+				Log::exception("veh", ExceptionInfo);
+			}
+			return EXCEPTION_CONTINUE_SEARCH;
 		case EXCEPTION_BREAKPOINT:
 			return EXCEPTION_CONTINUE_SEARCH; // this happens routinely with antidebug, not interesting
 		default:

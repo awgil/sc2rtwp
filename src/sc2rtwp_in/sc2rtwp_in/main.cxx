@@ -23,7 +23,7 @@ void init()
 
 	// debug stuff - should be possible to disable completely and still run this
 	DebugVEH::instance().install();
-	DebugStackProtect::instance().installMainThread();
+	//DebugStackProtect::instance().installMainThread();
 	DebugDelayedCrash::instance().installTickMonitor();
 	DebugDelayedCrash::instance().installChangeMonitor();
 	//DebugTriggerIds::instance().install();

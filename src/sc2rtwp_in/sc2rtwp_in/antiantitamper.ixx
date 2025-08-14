@@ -28,6 +28,12 @@ import injected.cs.antitamper;
 // 4. The antitamper state itself is hashed, and there's a code in a dedicated tamper detection thread that checks it for tampering.
 //    Since we're changing the size of the page hash table, which is stored in the region of the antitamper structure that is hashed, this needs fixing too.
 //    Solutions are exactly same as for previous point.
+// 5. The antitamper state contains two pointers that are normally mapped to same physical page, and there's a code that verifies that changing one affects the other.
+//    This detects the remapping we do to enable protection change, which we need to be able to hook stuff.
+//    Current solution is to patch the jump in the function to skip this check.
+//    Other possible alternatives are:
+//    - patch one of the pointers to point to the same memory as the other pointer - requires replicating encoding/decoding logic
+//    - restore the mapping - also requires replicating at least decoding logic
 export class AntiAntitamper
 {
 public:
@@ -57,6 +63,9 @@ public:
 		auto& hooker = App::instance().hooker();
 		hooker.patchJumpToUnconditional(0x206C63); // page hash
 		hooker.patchJumpToUnconditional(0x20721E); // state hash
+
+		// skip memory mapping check
+		hooker.patchJumpToUnconditional(0xEE1A55);
 	}
 };
 
