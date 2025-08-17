@@ -37,15 +37,15 @@ export struct AntitamperStatic
 	u32 currentCrashReason; // usually 0, set to reason field when crash process starts; used to pass information to SEH filter or something
 	AntitamperDynamic* dynState;
 	void* pageHashMismatchCallback; // an optional callback executed when page hash mismatch is detected; it's null on runtime (some leftover debug thing?) and callers validate it's inside main code section
-	bool flag0;
-	bool flag1;
-	bool flag2;
-	bool flag3;
-	bool flag4;
-	bool flag5;
-	bool flag6; // related to page hashing
-	bool flag7; // related to page hashing
-	bool pageHashUsesAVX2;
+	bool supportSSE;
+	bool supportSSE2;
+	bool supportSSE41;
+	bool supportSSE42;
+	bool supportAVX;
+	bool supportAVX2;
+	bool pageHashUsesSSE42; // == supportSSE42, related to page hashing
+	bool pageHashUsesSSE2; // == supportSSE2, related to page hashing
+	bool pageHashUsesAVX2; // == supportAVX && supportAVX2 && windows version is 6.3 or >= 10
 
 	// this is filled out by TLS callback, don't know whether it's used by something (some antidebug checks that detect injected threads maybe?)
 	u32 knownThreadsSpinlock;

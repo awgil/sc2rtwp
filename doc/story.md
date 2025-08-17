@@ -639,3 +639,259 @@ Both buffers look identical. So it seems that the code checks whether write into
 I did remap the code section before, so that I can inject - this explains why whatever custom mappings they've had are now broken.
 
 Let's just patch out the change. Of course, I could also restore the mappings - or even better, just change one of the fields so that they decode to same pointer - but that would require replicating the encoding logic. That's more work, let's do that only if I find that the check is duplicated in multiple places.
+
+## Deeper dive into obfuscation
+
+While poking around the dump, I've found an outlined version of the encryption function. It's a function in the static initializer table (used by CRT to initialize globals before `main` starts executing), it's #15 there, and it sets pagehash checksum to encrypted zero.
+The function works like this:
+* First, it takes two constants and applies `antidebug_obfuscate` to them - giving us obfuscated constants.
+* Then, it does four rounds of transformation using another function I'll call `antidebug_primitive`.
+** The first argument is either a constant or a value read from a memory block I'll call `antidebug_xor_constants`. It's always accessed by index < 4096 (either 12 low or 12 high bits of some value) and read as qword, so it's 4096+8 bytes in size. It's located between list of known threads and delayed crash state.
+** The second argument is either high or low dword of input or a result of a previous round.
+** The third and fourth arguments are constants.
+
+The pseudocode of the function:
+```
+qword c1 = k1, c2 = k2;
+antidebug_obfuscate(&c1, &c2);
+qword key1 = *(qword*)(antidebug_xor_constants + (c2 & 0xFFF));
+qword key2 = *(qword*)(antidebug_xor_constants + (c2 >> 52));
+// aN are either low or high dword of k2, key1 or key2, at least I haven't seen any others
+qword x1 = { in_lo, in_hi ^ antidebug_primitive(a1, in_lo, n1, n2) }; // { lo, hi }
+qword x2 = { x1_lo, x1_hi ^ antidebug_primitive(a2, in_lo, n3, n4) };
+x2 ^= c1;
+qword x3 = { x2_lo, x2_hi ^ antidebug_primitive(a3, x2_lo, n5, n6) };
+return     { x3_lo, x3_hi ^ antidebug_primitive(a4, x2_lo, n7, n8) };
+```
+Note that in this case `n7 == n1` and `n8 == n2`, but it's a coincidence.
+
+One way to simplify that, if we note that every round of `antidebug_primitive` does not actually change low dword:
+```
+in ^= antidebug_primitive(a1, in_lo, n1, n2) << 32;
+in ^= antidebug_primitive(a2, in_lo, n3, n4) << 32;
+in ^= c1;
+in ^= antidebug_primitive(a3, in_lo, n5, n6) << 32;
+in ^= antidebug_primitive(a4, in_lo, n7, n8) << 32;
+return in;
+```
+The important takeaway here is that low dword is actually not heavily transformed - it's just xorred with a transformed constant. This can be confirmed by looking through some examples of similar inlined obfuscation and results of constant propagation.
+It also explains why the few dword fields in `AntidebugState` are encoded with a simple xor - all these rotations etc are optimized away, because they would only affect high dword.
+
+Another important nontrivial conclusion is that to invert the encryption, one just needs to apply all these xors in reverse order: only low dword of the value is used as an argument, and only high dword is affected by xor.
+
+Now looking at `antidebug_primitive`: the signature is `uint (uint key, uint value, uchar op1, uchar op2delta)`. It performs two operations:
+* First, it calculates intermediate value `uint inter` from `key` or `value`, depending on `(op1 + op2delta) & 7`.
+* Then, it calculates the result from `value` and `inter`, depending on `op1`.
+
+Pseudocode:
+```
+uchar op2 = op1 + op2delta;
+uint shift = (op2 & 0xF) + 1;
+uint inter = (op2 & 7) switch {
+	0 => rotl(key, shift),
+	1 => rotl(value, shift),
+	2 => rotr(key, shift),
+	3 => rotr(value, shift),
+	_ => key
+};
+return op1 switch {
+	1 => inter - value,
+	2 => inter ^ value,
+	3 => 2 * inter - value,
+	4 => 2 * value - inter,
+	5 => value - inter,
+	6 => ~inter ^ value,
+	7 => inter ^ ~value,
+	_ => inter + value
+};
+```
+It is now clear how one could reverse-engineer the constants from the inlined call (shift in rotate gives op2, what type of operation is perfomed later gives op1).
+
+## Analyzing bootstrap code
+
+After posting this, I've got a few DMs with various bits of useful info. One thing in particular that was interesting to me was that apparently SC2 has some part of the obfuscation that's machine specific. To find out more, let's take a deeper look at the initial boot flow.
+
+### Phase T
+
+Opening the executable binary in IDA again, with all the knowledge gained before, it doesn't look too bad anymore. The main entrypoint has some jump obfuscation going, but the script I've made before makes short work of it.
+It then does the already familiar 'manual import' (searching loaded dlls by FNV hash of the name - `user32.dll` in this case - then searching for exported function by FNV - `MessageBoxW` in this case) and then shows an error. After that it similarly finds `ExitProcess` in `kernel32.dll` and calls it.
+So everything interesting must happen before entrypoint, and if entrypoint is executed, it means the bootstrap process has failed.
+
+The only interesting thing in the entry point is the error message - it uses the hardcoded string `Game Initialization Failed: #`, but replaces the last character with a value of some global. As we'll see later, this is a sort of 'initialization phase' tag.
+The initial value is `T`. From now on, I'll call the phases by the tag name.
+
+### Phase U
+
+The next place to look for init code is obvious - if it is to be complete before entrypoint, it must be TLS. TLS directory has a single callback, IDA helpfully calls it `TlsCallback_0` automatically - let's look at it.
+The first thing it does is set the init phase tag to `U`, and returns if the Reason is not `DLL_PROCESS_ATTACH` (fine, it's a bootstrap code).
+
+The next block ensures the next 256k on the stack are committed. It finds the first module in the loader's module list (== the main executable), ensures it doesn't go below the `SizeOfStackReserve` minus 3 pages,
+and then starting from retaddr on stack touches (reads) a byte per page until either reaching a limit or touching all desired pages.
+This is probably done now to avoid interfering with VEH thing it will set up later.
+
+Next thing it does is fills the 4104-byte (a page + 8 bytes) area with random values (here and everywhere else 'random' is based on rdtsc + some transformation). Cross-referencing the old idb, it's apparent that this area is `antidebug_xor_constants` - so this is what fills the encryption keys.
+
+Next thing does CPUID instructions to determine processor features. It initializes the global flags I've seen before, checked in pagehash code. First 6 flags are generic capabilities (SSE, SSE2, SSE4.1, SSE4.2, AVX and AVX2).
+Next two flags are copies of SSE4.2 and SSE2 support flags - however, these are checked in pagehash logic, so I suspect their meaning is `pagehash supports algorithm X` (and thus pagehash supports SSE4.2 if and only if processor supports SSE4.2).
+The final flag is set if both AVX and AVX2 are supported and windows version is >= 6.3 - this is a `pagehash supports AVX` flag. I suspect the windows version check is needed here because some old windows versions didn't preserve full AVX state across context switches, or something similar.
+
+Finally, it finds the TLS callbacks table in the executable module, manually finds `kernel32.dll` and `VirtualProtect` in it, and checks `PEB->NtGlobalFlags` for heap-check flags (i assume this is a debugger check).
+If heap check flags aren't all set, it modifies the TLS callback table (since it's in rdata section, it changes protection to `READ_WRITE` before and restores original after).
+In TLS table, it replaces the first function with something that looks encrypted, and then inserts two more entries (taking care to shift any further TLS callbacks, even though there are none).
+The third TLS callback also looks encrypted, but the second is a normal function. Let's call these three functions `tls_bootstrap_0/1/2`.
+
+It then returns, and since the new TLS entries were added, loader would call `tls_bootstrap_1`.
+
+### Phase I
+
+The second TLS function immediately sets phase tag to `I` and just calls the inner function `tls_bootstrap_1_impl`. This inner function immediately returns if `Reason` is not `DLL_PROCESS_ATTACH`.
+
+The first thing it does is go through relocation table of the executable and gather all relocations that straddle page boundary into a global array. There are actually none, at least in the version of executable I was reversing - it will become clear why this is needed later.
+The global array has enough space for 128 entries, if there are more such relocations - it will crash by doing divide-by-zero.
+
+The next bit is a bit verbose, but not very interesting - it finds four different module entries in the loader's module list: the 'primary' (whose `DllBase` is equal to the function argument), the first in list (normally it's the same as primary), `kernel32.dll` and `ntdll.dll`.
+
+Then it calls another function: `bool setup_veh(IMAGE_DOS_HEADER *kernel32, IMAGE_DOS_HEADER *ntdll)` (the name, of course, was chosen after reversing). This function again does some verbose manual imports, but essentially it's quite simple:
+* Find `RtlAddVectoredExceptionHandler` in ntdll, check that it doesn't start with breakpoint instruction, xor with constant and store in a global.
+* Then call it to register new VEH handler (let's call the function `bootstrap_veh_handler`) and store the returned handle in a global. I'll get to the VEH handler later.
+* Find `CloseHandle`, `VirtualAlloc`, `NtCreateSection`, `MapViewOfFileEx`, `VirtualProtect`, `UnmapViewOfFile` and `RltRemoveVectoredExceptionHandler` in corresponding dlls, check that they don't start with int3, xor with their own constants and store in globals.
+* If anything failed, returns `false`, and the caller instantly returns (this will lead to a crash).
+* And finally if everything's good, execute `hlt` instruction, then return `true`.
+
+Since `hlt` is a privileged instruction, it then transfers control to the VEH handler, so let's take a look at it.
+
+### VEH handler
+
+The installed VEH handler is a simple wrapper, everything is happening in the inner function `bootstrap_veh_handler_impl`. It only cares about two exceptions - `EXCEPTION_PRIV_INSTRUCTION` and `EXCEPTION_SINGLE_STEP`.
+For `EXCEPTION_PRIV_INSTRUCTION`, it inspects what caused the exception and only handles `hlt` and `wbinvd`; it adjusts RIP to skip them. For anything else, it just returns `EXCEPTION_CONTINUE_SEARCH`.
+
+Then depending on state, it either enables or disables single-step flag. So this makes the design clear:
+* Privileged instructions are used to control VEH logic: `hlt` enables it, `wbinvd` disables it.
+* When enabled, VEH forces itself to execute once per normal instruction by constantly setting single-step flag.
+* VEH also keeps an invocation counter and disables itself after running 0x7E0 times (unless it was explicitly disabled earlier).
+* The exit code and the argument (exception details) is kept in a global, xorred with constant.
+
+Now, the payload logic of the VEH handler looks complicated (15 different subfunctions, and a few globals), but really most of that is just junk code, there's only one important thing VEH does, so let's analyze. I've called all subfunctions `bootstrap_veh_subN` for now.
+
+All these subfunctions are similar in construction. Looking at the first one:
+* Check if `dr7` register is non-zero (meaning any hw breakpoints active) - and if so, crash by changing RIP in context to point to `bootstrap_veh_continuation_bad` and RDX to 0 - the function would then attempt to read from a value pointed to by RDX and crash with AV.
+* Count number of times it was called, return `false` if value is low enough (less than some constant plus some random value).
+* At a certain number of calls, execute some logic.
+* Crash if some global is set (`gBootstrapRegion_hash_mismatch`, described later).
+
+Now specifics of these functions:
+* sub1 at some point calculates the hash of a region (let's call it `gBootstrapRegion_start` and `gBootstrapRegion_end`, looking at addresses it encompasses the whole bootstrap code).
+** If this is the first time it's hashed (`gBootstrapRegion_hash` is 0), save it in a global. Otherwise compare with global - and on mismatch set `gBootstrapRegion_hash_mismatch`. Finally, if `gBootstrapRegion_hash_mismatch` is set - crash.
+** Also it sets a global `gVEHState1` to it's initial value (the main VEH function xors it with this later, so effectively it sets it to logical zero).
+* sub2 is similar, except that is sets other global `gVEHState2` to its logical zero.
+* sub3 reads some chunk of memory, xors it with other chunk of memory, and then does nothing with the result (unless I've missed something, this looks like pure junk). Also crashes on `gBootstrapRegion_hash_mismatch`, even though it doesn't actually hash the region.
+* sub4 sets some other global `gVEHState3` (a byte this time) to a logical zero or one, randomly depending on rdtsc.
+* sub5 is same as sub1, except that it sets `gVEHState1` to logical non-zero (the value that main VEH function later expects).
+* sub6 is similar to sub4, except that it sets `gVEHState4` to a logical zero or one, randomly depending on rdtsc.
+* sub7 is similar to sub3, except that it hashes a different region (and also does nothing with it).
+* sub8 is same as sub2, setting `gVEHState2` to expected value (like sub5 does to sub1).
+* sub9 sets the global `gVEHCounter1` to a random value < 4096 (this is later counted down by main function).
+* sub10 only rehashes the region, but doesn't change any other globals. It is not called at all if sub4 set its state to logical zero.
+
+After all these functions were called enough times (and so returned true), the main function verifies that `gVEHState1` is set to whatever value sub5 should have set it to (and crashes if that's not correct).
+Then it starts calling sub11 until it was called enough (before that, it sets `gVEHCounter2` to another random value). And then it does another check (whether kernel debugger is enabled) and crashes on failure.
+
+At this point it checks whether another global is non-zero. So far we haven't seen a code that initializes it - this is done later by code in TLS callback. Until it's non-zero, it simply sometimes rehashes the bootstrap region and returns.
+
+After that global is initialized, it counts down `gVEHCounter2` times (set by sub11). Then it verifies that `gVEHState2` is set to expected value by sub8 (crashes if not), depending on `gVEHState4` calls another function sub12 (this one is similar to sub3, does nothing interesting).
+Checks for hardware breakpoints again (crashes if found), does another pointless function sub13 (similar to sub3), and finally it calls the only important function `sub14` in the whole story.
+After it's done, it does another countdown for `gVEHCounter1` (set by sub9), and from that point keeps calling yet another pointless function sub15 (similar to sub3).
+
+TLDR of all this - this is a whole bunch of junk that does some anti-tampering checks (rehashing bootstrap code periodically, presumably to detect usual int3 breakpoints, checking hardware breakpoints and kernel debugger's presence).
+The only important function in all this is `sub14`. It can't be called until normal TLS code initializes a particular global, so let's come back to that later once we understand what it is.
+
+### Back to TLS
+
+Now that we're back to the normal code, `setup_veh` has returned true, every single instruction we execute triggers VEH doing it's silly shit (damn this must be so inefficient... poor CPU).
+The only problem we need to deal with is - there are now a bunch of `hlt` instructions in the code (these kick the VEH to restart if it reaches the invocation limit and disables itself), and IDA considers them to be noreturn.
+It's easy enough to fix in disassembly (by manually adding flow xref to next instruction), but I don't know how to fix it in hexrays. Thankfully, they are not particularly important (until we reach `wbinvd`), so I just nop them out as I see them.
+
+The next piece of code does some decryption. This is a recurring pattern that we'll see a lot in the future.
+First, it initializes the scratch buffer (`char[256]`) so that `scratch[i] == i`. Then it shuffles it around, using some global memory block to guide it (find the next index to swap). Finally, it uses it to decrypt some data (this time it's a 12-byte structure).
+
+The decrypted structure is then checked for tampering (first dword is compared to FNV hash of the rest), and then assuming it's all good some function is called. Let's look at this function.
+First it has some familiar obfuscation I've seen already, where it takes a few algorithm-parameter pairs as arguments and emits a bunch of code that ends up being identity transformation - this can just be ignored.
+Then it goes through all loaded modules, takes the substring of their names (prefix/suffix/full name, depending on structure, of a length depending on a structure), and compares to the hash stored in an input structure.
+So it's clear: this function is `bool any_module_loaded(ModuleEntry* entries, int numEntries, ...obfuscationPairs)`. The `ModuleEntry` is `uint hash; ushort len; bool prefix; bool suffix;`.
+The TLS callback then passes the decrypted data as single module entry - and if the matching module is loaded (or if the buffer was tampered with), the function returns immediately.
+So this is some 'blacklist' for loaded dlls, since I only know the hash, I have no clue what this forbidden module is :)
+
+The next thing TLS callback does is decrypt in-place some large (size 0x398) structure in data section - let's call it `gBootstrapInfo` and define a `BootstrapInfo` structure to match it.
+
+Next step is calling `VirtualAlloc` (it was found by `setup_veh` before) to allocate a chunk of memory. The size is `0xE88 + 0x30 * (NumSectionsInExecutableImage + 1) + size of some function`. The allocated memory is then immediately filled with random bytes.
+This pointer is later assigned to a global that - by cross-referencing dump - I know to be the pointing to `AntidebugState` - so we know what the first `0xE88` bytes are.
+There's also an early-out if `BeingDebugged` flag is set in PEB in the middle of this.
+
+Then it calls `NtCreateSection` of the size equal to the executable image size and with `SEC_NO_CHANGE` flag - ok this looks like the start of the remapping code, I've learned about it way at the beginning of this investigation.
+Next is `MapViewOfFileEx`, followed by `VirtualProtect` marking the entire image as `PAGE_EXECUTE_READWRITE` and copy of the entire image into the new mapping. Next is copy of a subset `gBootstrapInfo` and finding first zero entry.
+Since this is probably related to remapping, let's call this substructure `SectionRemapInfo`, it has three dwords, and there is an array of 32 such structures in `BootstrapInfo` at offset 8.
+
+Finally, some function is copied to the end of the block allocated by `VirtualAlloc` before, and then VEH is stopped by executing `wbinvd`. This looks like preparing to unmap original executable and something with the sections, so let's call the function `remap_sections`.
+
+### Phase M
+
+At this point the TLS function sets phase tag to `M` and calls the copy of `remap_sections`. The function is simple, it accepts a single pointer, so let's define an args structure, define all fields that are accessed in the function, and then go back to TLS to see how they are filled:
+```
+struct RemapSectionsArg {
+	/* 0x00 */ void* xorredImagebase; // original, where loader mapped the exe
+	/* 0x08 */ void* xorredSectionHandle;
+	/* 0x10 */ void* xorredSectionMapping; // where we're remapping exe to
+	/* 0x18 */ SectionRemapInfo* xorredSectionInfo;
+	/* 0x20 */ uint xorredNumSections;
+	/* 0x28 */ void* xorredUnmapViewOfFile;
+	/* 0x30 */ void* xorredMapViewOfFileEx;
+}
+```
+Every field is xorred with some constant, which can be seen either in TLS or in remap functions. The function itself is very simple - it calls `UnmapViewOfFile` on the imagebase and then `MapViewOfFileEx` to map each section in `sectionInfo` individually, at the same address.
+
+After remapping is done, another `hlt` instruction restarts VEH. At this point, each section is mapped into two places - at the original address that loader selected, and at whatever address was assigned by first `MapViewOfFileEx`.
+
+TLS function then records start and size of three sections; two from `gBootstrapInfo` (last four fields) - corresponding to .text and .data sections of the exe, and third same as .text, unless executable is not the first loaded module (not sure what this all means).
+The corresponding fields in bootstrap info are then overwritten with random values.
+
+Finally TLS function stores the original section mapping in a global that is checked by VEH handler - this unblocks the rest of the VEH logic. TLS function then starts looping doing pointless operations until some global is initialized (presumably, by VEH).
+Before going back to VEH, a quick look into the code after the loop ends shows a familiar obfuscation pattern - two constants are saved in variables, then a function is called with their addresses.
+Cross-checking RVAs - it's indeed the familiar `antidebug_obfuscate` function - however, it's decrypted for now. The hypothesis then is that VEH decrypts it and sets this global once it's ready - let's verify it.
+
+### The rest of the VEH handler
+
+Now `bootstrap_veh_sub14` can finally run. This follows the familiar pattern of the VEH subfunctions, but the logic it executes when specific invocation count is reached is interesting.
+
+It starts by reading `KUSER_SHARED_DATA.NumberOfPhysicalPages`, hashing it, then copying 1024 byte region from a buffer that depends on `hash & 0xF` into a local. Then it does some decryption loops.
+Finally, it does some 'makeshift relocations' - looks for specific hardcoded values in the decoded output and replaces them with code section start/end/size - and writes the result back into the mapped section, right where `antidebug_obfuscate` is.
+After that is done, it sets the global that the TLS is now waiting for.
+
+The last important thing it does before returning is calculates the hash of the decrypted buffer, obfuscates it using now-decoded `antidebug_obfuscate`, and stores it in a global `gObfuscateHash`.
+It then obfuscates a constant zero with some other arguments and stores in another global `gObfuscatedZero`.
+
+So this seems to be this 'machine-specific' part of the obfuscation process - there are 16 different variants of the `antidebug_obfuscate`, and whatever is selected depends on machine properties (num physical pages).
+I've made a simple script to decode all variants and save them into a file, and then loaded this file into idb - all these functions are conceptually similar, but use slightly different operations and values.
+They also all contain a return-address check and crash if called from code outside executable image - and because they are hashed, there's probably some function somewhere that checks it for tampering (although I haven't seen it).
+All of them are symmetric, so the encryption/decryption is identical. Apparently I've observed variant 9.
+
+And that is the only important thing that VEH does, the rest is usual crap.
+
+### Back to TLS, again
+
+As soon as the `antidebug_obfuscate` is decrypted, TLS function continues - and next thing it does is use it to initialize a bunch of `AntidebugState` fields:
+* 0x750 to imagebase of kernel32.dll
+* 0x0F8 to page hash table (a block of VirtualAlloc'd memory, sized to contain qword per page fitting into `SizeOfImage`) and 0x100 to the number of qwords in the page hash table
+* 0x050 to imagebase of the executable
+* 0x188 to the address of the first section mapping
+* 0x2A3 to whether first module in loader's module table is not the executable (a bool)
+* 0x2F0 to the loader's entry corresponding to ntdll.dll
+
+It then calls another function (let's call it `init_antidebug_state`) to fill out more stuff:
+* TODO
+
+Finally, it stops VEH by executing `wbinvd` and finally removing it completely by `RtlRemoveVectoredExceptionHandler`.
+
+### TODO
+* Phase F - resolving imports
+* Phase D - decrypting executable pages and setting pagehash entries, misc hashes, extra mapping setup
+* Phase C - post-decrypt TLS callback, patching entry point
