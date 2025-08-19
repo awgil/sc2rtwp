@@ -886,12 +886,38 @@ As soon as the `antidebug_obfuscate` is decrypted, TLS function continues - and 
 * 0x2A3 to whether first module in loader's module table is not the executable (a bool)
 * 0x2F0 to the loader's entry corresponding to ntdll.dll
 
-It then calls another function (let's call it `init_antidebug_state`) to fill out more stuff:
-* TODO
-
+It then calls another function (let's call it `init_antidebug_state`) to initialize the page hash table with obfuscated zeros and fill out more fields in `AntidebugState`.
 Finally, it stops VEH by executing `wbinvd` and finally removing it completely by `RtlRemoveVectoredExceptionHandler`.
 
-### TODO
-* Phase F - resolving imports
-* Phase D - decrypting executable pages and setting pagehash entries, misc hashes, extra mapping setup
-* Phase C - post-decrypt TLS callback, patching entry point
+### Phase F
+
+The next part starts by setting phase tag to `F`, and it deals with imports. First, it calls a function I'll call `get_kernel32_apis`, which just uses now-familiar manual lookup to find things next part will need - specifically, `LoadLibraryA`, `GetProcAddress` and `VirtualAlloc`.
+Then it reads the PE header for Import and IAT directory entries, decrypts the import directory's size field (which actually contains RVA of the encrypted import table, apparently that doesn't break the loader, huh), and calls a `decrypt_imports` function.
+
+The encrypted import table is just a zero-dword-terminated array of encrypted `IMAGE_IMPORT_DESCRIPTOR` structures - so the function simply decrypts each entry, decrypts the name of the library and calls `LoadLibraryA`.
+Then there's a piece of code that does something special for libraries with `msvc` string (there are none in the executable). Finally, it loops through the imported function list for the library, decrypts each function name (unless import is by ordinal), and calls `GetProcAddress`.
+
+The only slightly interesting part is how it builds an import thunk. First, it allocates a page to store them. Then, as an extra layer of obfuscation, it generates a random (5 to 14) number of random adjustments (add/sub/xor) to the address, split into chunks of 1-5 operations.
+Then it tries to fit each chunk in a page, first by trying a random offset up to 7 times, then by brute-force methodically trying every single offset. If it can't find a spot, or if the current page is 50%+ full already, it allocates a new page.
+Finally, once the spot for the chunk is found, it emits the instructions (initial `mov rax, ...`, a sequence of add/sub/xor that eventually turns rax into the desired address, and finally a `jmp rax`).
+
+All in all, this looks like a pretty pointless obfuscation - hexrays automatically does this maths and shows the correct call in decompilation output.
+
+### Phase D
+
+Finally, the most interesting part starts, identified by phase tag `D`. The `BootstrapInfo` contains an array of 32 (rva, size) pairs starting at offset 0x188 - these are the encrypted regions of the binary (in practice, executable only has one entry there, which is the entire text section).
+
+The function then goes through each page of each region and, unless it's within the area containing bootstrap code, calls one of the three versions of the decryption functions. Since the executable has only one region, only first of these variants seems to ever be used.
+Even then, they seem to be functionally identical (unless there are some minor differences I didn't spot). So let's focus on the first variant - `decode_page_var0`.
+
+The function starts with familiar algorithm-parameter adjustment pairs (hilariously, it 'obfuscates' the magic constants in DOS & PE headers - probably their encryptor just picks first constants used by the function).
+Then it verifies whether first the first byte in the pagehash entry is still not set and early-outs if it is; the function also sets this to 1 at the exit, implying that this field is `bool decrypted`.
+
+Assuming the page still needs to be decrypted, the function then goes through all relocations intersecting the page and undoes them.
+This is understandable - the loader fucked up the encryption by applying the relocations - although I wonder, why doesn't the encryptor just remove them from the native relocation table?..
+
+TODO: decrypting executable pages and setting pagehash entries, misc hashes, extra mapping setup
+
+### Phase C
+
+TODO: post-decrypt TLS callback, patching entry point

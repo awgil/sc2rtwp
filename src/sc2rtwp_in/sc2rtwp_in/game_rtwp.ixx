@@ -13,6 +13,27 @@ import injected.cs.timingdata;
 import injected.cs.scriptvar;
 import injected.cs.unit;
 
+struct MissileAnim
+{
+	float startT;
+	i32 field_4;
+	i32 endIndex;
+	i32 field_C;
+	i32 numLimits;
+	float limits[2];
+	char field_1C[20];
+	i32 finalPosIdx;
+	char field_34[12];
+	float positions[3 * 2];
+	char field_58[128];
+	i32 finalRotIdx;
+	float endT;
+	i32 field_E0;
+	i32 field_E4;
+	float rotations[4 * 2];
+};
+static_assert(sizeof MissileAnim == 0x108);
+
 // SC2 deals with timing in a somewhat weird way:
 // - every frame, it converts real time into game time (scaled by game speed), accumulates it, and whenever it reaches a threshold, executes simulation tick
 // - simulation tick increments 'game' timer unconditionally by fixed value 256, increments 'real' timer by inversely scaled value, and executes various logic ticks (triggers, unit movement, etc)
@@ -33,6 +54,16 @@ public:
 	{
 		auto& app = App::instance();
 		oriTickSimulation = app.hooker().hook(0x67BCE0, 0xF, hookTickSimulation);
+
+		// do not tick missiles while game is paused
+		oriMissileTick = app.hooker().hook(0x1F372B0, 0x12, hookMissileTick);
+
+		// do not crash the game on unpause if missile interpolation is slightly wrong
+		// the interpolation code will set lookup index to UINT32_MAX on failure and do out-of-bounds access, just extrapolate a bit instead...
+		auto rvaMissileAnimGetInterpolatedPosRot = 0x1F33C80;
+		memset(app.hooker().imagebase() + rvaMissileAnimGetInterpolatedPosRot + 0xCA, 0x90, 3); // nop out 'or ecx, 0xFFFFFFFF'
+		// TODO: remove hook, it's just logging
+		//oriMissileAnimGetInterpolatedPosRot = app.hooker().hook(rvaMissileAnimGetInterpolatedPosRot, 0x12, hookMissileAnimGetInterpolatedPosRot);
 
 		app.addKeybind({ VK_SPACE }, [this]() { toggle(); });
 
@@ -127,6 +158,51 @@ private:
 			inst.oriTickSimulation();
 		}
 	}
+
+	void (*oriMissileTick)(void*) = nullptr;
+	static void hookMissileTick(void* self)
+	{
+		auto& inst = instance();
+		if (!inst.mPauseAtTick)
+			inst.oriMissileTick(self);
+	}
+
+	//void (*oriMissileAnimGetInterpolatedPosRot)(MissileAnim*, float, i32*) = nullptr;
+	//static void hookMissileAnimGetInterpolatedPosRot(MissileAnim* self, float t, i32* out)
+	//{
+	//	auto& inst = instance();
+	//	auto index = self->finalPosIdx;
+	//	if (t < self->endT)
+	//	{
+	//		index = self->endIndex;
+	//		if (t < self->startT)
+	//		{
+	//			int limitsCount = self->numLimits;
+	//			int i = 0;
+	//			if (limitsCount > 2)
+	//				limitsCount = 2;
+	//			if (limitsCount)
+	//			{
+	//				while (t < self->limits[index])
+	//				{
+	//					index = ((unsigned char)index - 1) & 1;
+	//					if (++i >= limitsCount)
+	//					{
+	//						index = -1;
+	//						break;
+	//					}
+	//				}
+	//			}
+	//			else
+	//			{
+	//				index = -1;
+	//			}
+	//		}
+	//	}
+	//	Log::msg("Interp {}: {} - {}, #{}/{}, lims={}/{}, pos=[{}, {}, {}]/[{}, {}, {}], idx={}", t, self->endT, self->startT, self->endIndex, self->numLimits, self->limits[0], self->limits[1],
+	//		self->positions[0], self->positions[1], self->positions[2], self->positions[3], self->positions[4], self->positions[5], index);
+	//	inst.oriMissileAnimGetInterpolatedPosRot(self, t, out);
+	//}
 
 private:
 	// tweak state

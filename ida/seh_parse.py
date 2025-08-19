@@ -374,7 +374,8 @@ class ExecutionContext:
             #print(f'> sim: {hex(ea)}')
             insn = decode_insn(ea)
             if not insn:
-                raise Exception(f'Failed to decode instruction at {hex(ea)}')
+                log(0, f'Failed to decode instruction at {hex(ea)}')
+                break
 
             flags = ida_bytes.get_flags(ea)
             if not ida_bytes.is_code(flags):
@@ -419,7 +420,7 @@ class ExecutionContext:
 
 
 def process_function(imagebase, ea_start, ea_end, ea_unwind, index, count):
-    unwind_flags = read_unwind_info_flag(ea_unwind)
+    unwind_flags = read_unwind_info_flag(ea_unwind) if ea_unwind else 0
     log(0, f'Processing function {index}/{count}: {hex(ea_start)} - {hex(ea_end)} unwind={hex(ea_unwind)} flags={hex(unwind_flags)}')
     if unwind_flags >= 4:
         print(f'Unsupported unwind flags at {hex(ea_unwind)}')
@@ -448,7 +449,7 @@ def process_function(imagebase, ea_start, ea_end, ea_unwind, index, count):
             print(f'Error while processing function at ${hex(ea_start)}: {e}')
             raise
 
-    ea_unwind_extra = unwind_payload_ea(ea_unwind)
+    ea_unwind_extra = unwind_payload_ea(ea_unwind) if ea_unwind else 0
     if unwind_flags & 3:
         primary_handler = imagebase + ida_bytes.get_dword(ea_unwind_extra)
         set_func_comment(ea_start, f'SEH primary handler: {hex(primary_handler)}: {"exception" if unwind_flags == 1 else "termination" if unwind_flags == 2 else "both"}')
@@ -483,6 +484,8 @@ def process_single_function(ea):
         print(f'Failed to find segment for {hex(ea)}')
         return
     imagebase = seg.start_ea
+    if imagebase == 0x140001000:
+        imagebase -= 0x1000 # hack: if file was loaded into idb without headers, adjust...
     exc = get_exception_data(imagebase)
     if not exc:
         return
@@ -498,6 +501,8 @@ def process_segment(ea):
         print(f'Failed to find segment for {hex(ea)}')
         return
     imagebase = seg.start_ea
+    if imagebase == 0x140001000:
+        imagebase -= 0x1000 # hack: if file was loaded into idb without headers, adjust...
     exc = get_exception_data(imagebase)
     if not exc:
         return
@@ -515,6 +520,7 @@ def process_segment(ea):
         process_function(imagebase, imagebase + begin, imagebase + end, imagebase + read_runtime_function_unwind_rva(exc[0], index), index, exc[1])
         index = chain_end
 
+#process_function(0x140000000, 0x140025A70, 0x140025EE5, 0, 0, 1)
 if process_entire_segment:
     process_segment(idaapi.get_screen_ea())
 else:

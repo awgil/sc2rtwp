@@ -2,6 +2,11 @@ import ida_funcs
 import ida_segment
 import ida_xref
 
+log_level = 5
+def log(level, msg):
+    if level <= log_level:
+        print(msg)
+
 def get_exception_data(imagebase):
     if ida_bytes.get_word(imagebase) != 0x5a4d:
         print(f'No executable header at {hex(imagebase)}')
@@ -58,7 +63,7 @@ def find_unwind_info(imagebase, ea, start, count):
     return None
 
 def process_function(imagebase, ea_start, ea_end, ea_unwind, index, count):
-    unwind_flags = read_unwind_info_flag(ea_unwind)
+    unwind_flags = read_unwind_info_flag(ea_unwind) if ea_unwind else 0
     log(0, f'Processing function {index}/{count}: {hex(ea_start)} - {hex(ea_end)} unwind={hex(ea_unwind)} flags={hex(unwind_flags)}')
     if unwind_flags >= 4:
         print(f'Unsupported unwind flags at {hex(ea_unwind)}')
@@ -88,6 +93,8 @@ def process_single_function(ea):
         print(f'Failed to find segment for {hex(ea)}')
         return
     imagebase = seg.start_ea
+    if imagebase == 0x140001000:
+        imagebase -= 0x1000 # hack: if file was loaded into idb without headers, adjust...
     exc = get_exception_data(imagebase)
     if not exc:
         return
@@ -97,4 +104,5 @@ def process_single_function(ea):
         return
     process_function(imagebase, unwind[0], unwind[1], unwind[2], 0, 1)
 
+#process_function(0x140000000, 0x140025A70, 0x140025EE5, 0, 0, 1)
 process_single_function(idaapi.get_screen_ea())

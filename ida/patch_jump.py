@@ -176,13 +176,13 @@ def find_sequence_end(ea, cond):
 ea = idaapi.get_screen_ea()
 cond = Conditional()
 end_ea = find_sequence_end(ea, cond)
-if end_ea >= ea + 2:
+if end_ea >= ea + 2 or end_ea < ea:
 	print(f'Jump to {hex(end_ea)}')
 	if ida_ua.create_insn(end_ea) == 0:
 		ida_bytes.del_items(end_ea, ida_bytes.DELIT_EXPAND)
 	ida_bytes.del_items(ea, ida_bytes.DELIT_EXPAND, end_ea - ea)
 	jmp_len = 0
-	if end_ea > ea + 129:
+	if end_ea > ea + 129 or end_ea < ea - 126:
 		jmp_len = 5
 		ida_bytes.patch_byte(ea, 0xE9)
 		ida_bytes.patch_dword(ea + 1, end_ea - ea - jmp_len)
