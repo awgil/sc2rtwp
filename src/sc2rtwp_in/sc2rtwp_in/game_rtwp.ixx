@@ -55,15 +55,16 @@ public:
 		auto& app = App::instance();
 		oriTickSimulation = app.hooker().hook(0x67BCE0, 0xF, hookTickSimulation);
 
-		// do not tick missiles while game is paused
+		// do not tick missiles while game is paused - otherwise they keep flying, which doesn't look nice
 		oriMissileTick = app.hooker().hook(0x1F372B0, 0x12, hookMissileTick);
 
 		// do not crash the game on unpause if missile interpolation is slightly wrong
 		// the interpolation code will set lookup index to UINT32_MAX on failure and do out-of-bounds access, just extrapolate a bit instead...
-		auto rvaMissileAnimGetInterpolatedPosRot = 0x1F33C80;
-		memset(app.hooker().imagebase() + rvaMissileAnimGetInterpolatedPosRot + 0xCA, 0x90, 3); // nop out 'or ecx, 0xFFFFFFFF'
+		// there are also few other places that do similar, patch them too... (nop out all `or reg, 0xFFFFFFFF` i see)
+		memset(app.hooker().imagebase() + 0x1F33C80 + 0xCA, 0x90, 3);
+		memset(app.hooker().imagebase() + 0x1F35DEB, 0x90, 6);
 		// TODO: remove hook, it's just logging
-		//oriMissileAnimGetInterpolatedPosRot = app.hooker().hook(rvaMissileAnimGetInterpolatedPosRot, 0x12, hookMissileAnimGetInterpolatedPosRot);
+		//oriMissileAnimGetInterpolatedPosRot = app.hooker().hook(0x1F33C80, 0x12, hookMissileAnimGetInterpolatedPosRot);
 
 		app.addKeybind({ VK_SPACE }, [this]() { toggle(); });
 

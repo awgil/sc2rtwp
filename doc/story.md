@@ -916,7 +916,17 @@ Then it verifies whether first the first byte in the pagehash entry is still not
 Assuming the page still needs to be decrypted, the function then goes through all relocations intersecting the page and undoes them.
 This is understandable - the loader fucked up the encryption by applying the relocations - although I wonder, why doesn't the encryptor just remove them from the native relocation table?..
 
-TODO: decrypting executable pages and setting pagehash entries, misc hashes, extra mapping setup
+The last remaining tricky bit is relocations straddling page boundary (remember the very beginning of phase I saving them in a global array) - the encrypted page bounds are adjusted so that full address is in the single block:
+if relocation straddles boundary between page N and N+1, the full address is encrypted as part of block N.
+
+At this point everything is ready, and the page is decrypted using familiar shuffling algorithm. As an extra layer, previous page's FNV hash is included into the algorithm for decrypting next page (and after decryption, just-decrypted-page is hashed).
+The relocations are reapplied after decryption is done.
+
+Finally, the decrypted page is hashed again using other algorithm and hash is recorded in page hash table - in other words, page hash table entry is set if and only if the page is encrypted in executable.
+
+### Finishing touches after all pages are decrypted
+
+TODO: hiding main thread from debugger, segment states + hashing page containing it, secondary mapping setup, clobbering headers
 
 ### Phase C
 

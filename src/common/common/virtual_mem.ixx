@@ -34,6 +34,7 @@ public:
 		mProcess = rhs.mProcess;
 		mPtr = rhs.mPtr;
 		rhs.mPtr = nullptr;
+		return *this;
 	}
 
 	~VirtualMemoryBlock()

@@ -60,6 +60,9 @@ function(add_target TARGET_NAME TARGET_TYPE)
 	endif()
 endfunction()
 
+set(capstone_DIR thirdparty/capstone/.install/lib/cmake/capstone)
+find_package(capstone)
+
 add_target(common LIB DEPS_PRIVATE ntdll)
 add_target(sc2rtwp EXE_CONSOLE DEPS_PRIVATE common)
 add_target(sc2rtwp_in DLL
@@ -67,3 +70,4 @@ add_target(sc2rtwp_in DLL
 	DEPS_PRIVATE common)
 add_target(logger EXE_CONSOLE DEPS_PRIVATE common)
 add_target(test_target EXE_CONSOLE)
+add_target(unpack EXE_CONSOLE DEPS_PRIVATE common capstone::capstone_static)
