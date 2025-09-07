@@ -133,6 +133,7 @@ public:
 	template<typename T> T* structAtRVA(rva_t rva) { return reinterpret_cast<T*>(mBytes.data() + rva); }
 
 	va_t imageBase() const { return mPEHeader->OptionalHeader.ImageBase; }
+	rva_t vaToRVA(va_t va) const { return static_cast<rva_t>(va - imageBase()); }
 	rva_t entryPoint() const { return mPEHeader->OptionalHeader.AddressOfEntryPoint; }
 	rva_t roundUpToFileAlignment(rva_t v) const { return (v + mPEHeader->OptionalHeader.FileAlignment - 1) & ~(mPEHeader->OptionalHeader.FileAlignment - 1); }
 
@@ -275,19 +276,19 @@ public:
 		mTLSDirEndRVA = tlsDir.VirtualAddress + tlsDir.Size;
 
 		auto tlsRoot = src.structAtRVA<IMAGE_TLS_DIRECTORY>(tlsDir.VirtualAddress);
-		auto tlsStartRVA = tlsRoot->StartAddressOfRawData - src.imageBase();
+		auto tlsStartRVA = src.vaToRVA(tlsRoot->StartAddressOfRawData);
 		auto tlsSize = tlsRoot->EndAddressOfRawData - tlsRoot->StartAddressOfRawData;
 		auto tlsSection = src.sections().find(tlsStartRVA);
 		ensure(tlsSection && tlsSection->name == ".tls" && tlsStartRVA == tlsSection->begin && src.roundUpToFileAlignment(tlsSize) == tlsSection->value->SizeOfRawData);
 
-		auto tlsCallbacksRVA = tlsRoot->AddressOfCallBacks - src.imageBase();
+		auto tlsCallbacksRVA = src.vaToRVA(tlsRoot->AddressOfCallBacks);
 		std::println("TLS callbacks at {}", src.formatRVA(tlsCallbacksRVA));
 		while (true)
 		{
 			auto tlsCallbackVA = *src.structAtRVA<va_t>(tlsCallbacksRVA);
 			if (!tlsCallbackVA)
 				break;
-			mCallbackRVAs.push_back(tlsCallbackVA - src.imageBase());
+			mCallbackRVAs.push_back(src.vaToRVA(tlsCallbackVA));
 			tlsCallbacksRVA += sizeof(va_t);
 		}
 	}

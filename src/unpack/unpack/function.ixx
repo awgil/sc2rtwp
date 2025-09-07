@@ -95,6 +95,17 @@ private:
 	Conditional mValue = Conditional::None; // invariant: mValue & ~mKnown == 0 (ie all unknown bits are zero)
 };
 
+export enum EdgeFlags : u8
+{
+	None,
+	Unconditional = 1 << 0, // the only edge in a block
+	PatchedChain = 1 << 1, // this is a jump that was represented by a chain in original code
+	Flow = 1 << 2, // immediately following instruction
+	Loop = 1 << 3, // jump to next iteration of a loop
+	Indirect = 1 << 4, // part of switch statement
+};
+ADD_BITFIELD_OPS(EdgeFlags);
+
 export class FunctionInfo
 {
 public:
@@ -111,13 +122,26 @@ public:
 		Halt, // hlt - this is used by bootstrap code to kick off VEH operation
 	};
 
+	// edge between two blocks
+	struct Edge
+	{
+		rva_t rva;
+		EdgeFlags flags;
+	};
+
 	struct Block : RangeMapEntry<rva_t>
 	{
 		std::vector<rva_t> instructions;
-		std::vector<rva_t> successors; // can be empty (if block ends with return / tail recursion jump), contain 1 entry (unconditional jump), 2 entries (conditional jump, first entry is implicit flow) or multiple entries (switch)
+		std::vector<Edge> successors; // can be empty (if block ends with return / tail recursion jump), contain 1 entry (unconditional jump), 2 entries (conditional jump, first entry is implicit flow) or multiple entries (switch)
+	};
 
-		bool firstSuccessorIsFlow() const { return !successors.empty() && successors.front() == end; }
-		bool successorNeedsPatching() const { return !instructions.empty() && instructions.back() == end; }
+	enum class ReferenceType
+	{
+		Unknown,
+		Address, // lea
+		Read, // operand 1+
+		Write, // operand 0 (can be read-write)
+		Call, // normal call or tail-recursion jmp
 	};
 
 	// a RIP-relative reference to some external executable item (function, piece of data, etc)
@@ -125,6 +149,7 @@ public:
 	{
 		rva_t insnRVA;
 		rva_t refRVA;
+		ReferenceType type;
 	};
 
 	FunctionInfo(PEBinary& src, rva_t funcStartRVA, std::string_view name)
@@ -141,16 +166,17 @@ public:
 			throw std::exception("RVA is mid function");
 
 		std::vector<rva_t> blockStartRVAs{ funcStartRVA };
-		auto queueJumpTargetRVA = [&](Block& block, rva_t rva, rva_t predecessorRVA) {
+		auto queueJumpTargetRVA = [&](Block& block, rva_t rva, EdgeFlags flags, rva_t predecessorRVA) {
 			//std::println("> scheduling [{:X}] {:X} -> {:X}", block.startRVA, predecessorRVA, rva);
 			blockStartRVAs.push_back(rva);
-			block.successors.push_back(rva);
+			block.successors.push_back({ rva, flags });
 		};
 		auto queueJumpTarget = [&](Block& block, cs_insn* insn) {
 			if (insn->detail->x86.operands[0].type == X86_OP_IMM)
 			{
 				// TODO: process tail recursion jumps...
-				queueJumpTargetRVA(block, insn->detail->x86.operands[0].imm - src.imageBase(), insn->address - mBinary.imageBase());
+				auto flags = insn->id == X86_INS_JMP ? EdgeFlags::Unconditional : EdgeFlags::None;
+				queueJumpTargetRVA(block, mBinary.vaToRVA(insn->detail->x86.operands[0].imm), flags, mBinary.vaToRVA(insn->address));
 			}
 			else
 			{
@@ -159,7 +185,7 @@ public:
 			}
 		};
 
-		std::vector<rva_t> hltRVAs;
+		std::vector<rva_t> hltRVAs, jumpPatchRVAs;
 		while (!blockStartRVAs.empty())
 		{
 			auto rva = blockStartRVAs.back();
@@ -174,14 +200,17 @@ public:
 				Block newBlock{ rva, rva };
 				while (true)
 				{
-					auto isn = src.disasm(rva);
-					if (!isn)
-						throw std::exception("Failed to disassemble instruction");
+					auto isn = ensure(src.disasm(rva));
 
-					auto operands = std::span<cs_x86_op>{ isn->detail->x86.operands, isn->detail->x86.op_count };
-					for (auto& op : operands)
+					for (int iOp = 0; iOp < isn->detail->x86.op_count; ++iOp)
+					{
+						auto& op = isn->detail->x86.operands[iOp];
 						if (op.type == X86_OP_MEM && op.mem.base == X86_REG_RIP)
-							mRefs.push_back({ rva, static_cast<rva_t>(rva + isn->size + op.mem.disp) });
+						{
+							auto type = iOp == 0 ? ReferenceType::Write : isn->id == X86_INS_LEA ? ReferenceType::Address : ReferenceType::Read;
+							mRefs.push_back({ rva, static_cast<rva_t>(rva + isn->size + op.mem.disp), type });
+						}
+					}
 
 					newBlock.instructions.push_back(rva);
 					newBlock.end = rva + isn->size;
@@ -197,25 +226,26 @@ public:
 					}
 					if (cat == InstructionType::EffectiveNop || cat == InstructionType::FlagsOnly || cat == InstructionType::JumpConditional)
 					{
-						auto chainEnd = findJumpChainEnd(src, rva, isn, {});
+						auto chainEnd = findJumpChainEnd(rva, isn, {});
 						if (chainEnd != 0)
 						{
-							queueJumpTargetRVA(newBlock, chainEnd, rva);
-							newBlock.end = rva; // will be patched
+							queueJumpTargetRVA(newBlock, chainEnd, EdgeFlags::Unconditional | EdgeFlags::PatchedChain, rva);
+							jumpPatchRVAs.push_back(rva);
+							newBlock.end = rva + 1; // will be patched; keeping it as 1 ensures that next byte can be reused for some other jump chain
 							break;
 						}
 					}
 					if (cat == InstructionType::JumpConditional)
 					{
 						// re-decode instruction, since it was overwritten while exploring jump chains
-						queueJumpTargetRVA(newBlock, newBlock.end, rva);
+						queueJumpTargetRVA(newBlock, newBlock.end, EdgeFlags::Flow, rva);
 						queueJumpTarget(newBlock, src.disasm(rva));
 						break;
 					}
 
 					if (cat == InstructionType::CallDirect)
 					{
-						mCalls.push_back({ rva, static_cast<rva_t>(isn->detail->x86.operands[0].imm - src.imageBase()) });
+						mRefs.push_back({ rva, mBinary.vaToRVA(isn->detail->x86.operands[0].imm), ReferenceType::Call });
 					}
 					if (cat == InstructionType::Halt)
 					{
@@ -225,7 +255,7 @@ public:
 					if (nextBlock != mBlocks.end() && newBlock.end == nextBlock->begin)
 					{
 						// we've reached a point where someone else jumped to, end the block now
-						newBlock.successors.push_back(newBlock.end);
+						newBlock.successors.push_back({ newBlock.end, EdgeFlags::Flow });
 						break;
 					}
 
@@ -246,57 +276,36 @@ public:
 				Block pred{ existing->begin, rva };
 				pred.instructions.assign(existing->instructions.begin(), isn);
 				mBlocks.edit(existing).instructions.erase(existing->instructions.begin(), isn);
-				pred.successors.push_back(rva);
+				pred.successors.push_back({ rva, EdgeFlags::Flow });
 				mBlocks.shrink(rva, existing->end, existing);
 				mBlocks.insert(std::move(pred), nextBlock - 1);
 			}
 			// else: this block was already processed, nothing to do here...
 		}
 
-		// if a block is immediately followed by a jump chain, then there's some other jump onto the jump chain, we need to fix up preceeding block
-		for (int i = 1; i < mBlocks.size(); ++i)
-		{
-			if (mBlocks[i - 1].end == mBlocks[i].begin && mBlocks[i - 1].successorNeedsPatching())
-			{
-				auto& prev = mBlocks.edit(mBlocks.begin() + i - 1);
-				ensure(prev.successors == mBlocks[i].successors);
-				prev.successors.clear();
-				prev.successors.push_back(mBlocks[i].begin);
-				prev.instructions.pop_back();
-			}
-		}
-
 		if (!mSEHEntry)
 			mEndRVA = mBlocks.back().end;
 
 		// sort references
-		std::ranges::sort(mCalls, std::less(), [](const Reference& ref) { return ref.insnRVA; });
 		std::ranges::sort(mRefs, std::less(), [](const Reference& ref) { return ref.insnRVA; });
 
-		applyPatches();
-		for (auto rva : hltRVAs)
-		{
-			// help ida - replace with 'icebp'
-			src.bytes()[rva] = 0xF1;
-		}
+		applyPatches(hltRVAs, jumpPatchRVAs);
 	}
 
 	const Block* findBlock(rva_t rva) const { return mBlocks.find(rva); }
-	const auto& calls() const { return mCalls; }
 	const auto& refs() const { return mRefs; }
 
+	auto calls() const { return mRefs | std::ranges::views::filter([](const Reference& ref) { return ref.type == ReferenceType::Call; }); }
 	auto refsToSection(const PEBinary::Section& section) const { return mRefs | std::ranges::views::filter([&section](const Reference& ref) { return section.contains(ref.refRVA); }); }
 
 	void gatherCodeRefs(std::vector<rva_t>& refs, const PEBinary::Section& codeSection) const
 	{
-		auto transform = std::ranges::views::transform([&](const Reference& ref) { return ref.refRVA; });
-		refs.append_range(mCalls | transform);
-		refs.append_range(refsToSection(codeSection) | transform);
+		refs.append_range(refsToSection(codeSection) | std::ranges::views::transform([&](const Reference& ref) { return ref.refRVA; }));
 	}
 
 private:
 	// returns jump chain end RVA if passed instruction is the start of the jump chain, or 0 if not
-	rva_t findJumpChainEnd(PEBinary& src, rva_t rva, cs_insn* insn, FlagState flags, bool afterJump = false)
+	rva_t findJumpChainEnd(rva_t rva, cs_insn* insn, FlagState flags, bool afterJump = false)
 	{
 		do {
 			auto next = rva + insn->size; // by default, continue with the flow
@@ -319,8 +328,8 @@ private:
 				if (insn->detail->x86.operands[0].type != X86_OP_IMM)
 					break; // indirect jump
 				// note: consider a following situation: jump chain -> test r1,r1 -> jz (diverging)
-				next = insn->detail->x86.operands[0].imm - src.imageBase();
-				auto target = findJumpChainEnd(src, next, src.disasm(next), flags, true);
+				next = mBinary.vaToRVA(insn->detail->x86.operands[0].imm);
+				auto target = findJumpChainEnd(next, mBinary.disasm(next), flags, true);
 				return target ? target : next;
 			}
 			else if (cat == InstructionType::JumpConditional)
@@ -328,37 +337,37 @@ private:
 				switch (insn->id)
 				{
 				case X86_INS_JO:
-					return findJumpChainEndCond(src, Conditional::OF, true, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::OF, true, flags, rva, insn);
 				case X86_INS_JNO:
-					return findJumpChainEndCond(src, Conditional::OF, false, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::OF, false, flags, rva, insn);
 				case X86_INS_JS:
-					return findJumpChainEndCond(src, Conditional::SF, true, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::SF, true, flags, rva, insn);
 				case X86_INS_JNS:
-					return findJumpChainEndCond(src, Conditional::SF, false, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::SF, false, flags, rva, insn);
 				case X86_INS_JE:
-					return findJumpChainEndCond(src, Conditional::ZF, true, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::ZF, true, flags, rva, insn);
 				case X86_INS_JNE:
-					return findJumpChainEndCond(src, Conditional::ZF, false, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::ZF, false, flags, rva, insn);
 				case X86_INS_JB:
-					return findJumpChainEndCond(src, Conditional::CF, true, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::CF, true, flags, rva, insn);
 				case X86_INS_JAE:
-					return findJumpChainEndCond(src, Conditional::CF, false, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::CF, false, flags, rva, insn);
 				case X86_INS_JP:
-					return findJumpChainEndCond(src, Conditional::PF, true, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::PF, true, flags, rva, insn);
 				case X86_INS_JNP:
-					return findJumpChainEndCond(src, Conditional::PF, false, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::PF, false, flags, rva, insn);
 				case X86_INS_JBE:
-					return findJumpChainEndCond(src, Conditional::BE, true, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::BE, true, flags, rva, insn);
 				case X86_INS_JA:
-					return findJumpChainEndCond(src, Conditional::BE, false, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::BE, false, flags, rva, insn);
 				case X86_INS_JL:
-					return findJumpChainEndCond(src, Conditional::SO, true, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::SO, true, flags, rva, insn);
 				case X86_INS_JGE:
-					return findJumpChainEndCond(src, Conditional::SO, false, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::SO, false, flags, rva, insn);
 				case X86_INS_JLE:
-					return findJumpChainEndCond(src, Conditional::LE, true, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::LE, true, flags, rva, insn);
 				case X86_INS_JG:
-					return findJumpChainEndCond(src, Conditional::LE, false, flags, rva, insn);
+					return findJumpChainEndCond(Conditional::LE, false, flags, rva, insn);
 				default:
 					throw std::exception("Unexpected Jcc");
 				}
@@ -371,27 +380,27 @@ private:
 
 			// if we're still here, continue following the chain...
 			rva = next;
-			insn = src.disasm(rva);
+			insn = mBinary.disasm(rva);
 		} while (true);
 		return afterJump ? rva : 0;
 	}
 
-	rva_t findJumpChainEndCond(PEBinary& src, Conditional cond, bool value, FlagState flags, rva_t rva, cs_insn* insn)
+	rva_t findJumpChainEndCond(Conditional cond, bool value, FlagState flags, rva_t rva, cs_insn* insn)
 	{
 		if (insn->detail->x86.operands[0].type != X86_OP_IMM)
 			return 0; // only direct jumps are supported
-		auto targetTaken = insn->detail->x86.operands[0].imm - src.imageBase();
+		auto targetTaken = mBinary.vaToRVA(insn->detail->x86.operands[0].imm);
 		auto targetNotTaken = rva + insn->size;
 		if (!flags.isKnown(cond))
 		{
 			auto flagsTaken = flags;
 			flagsTaken.setConditional(cond, value);
-			auto endTaken = findJumpChainEnd(src, targetTaken, src.disasm(targetTaken), flagsTaken, true);
+			auto endTaken = findJumpChainEnd(targetTaken, mBinary.disasm(targetTaken), flagsTaken, true);
 			if (!endTaken)
 				endTaken = targetTaken;
 
 			flags.setConditional(cond, !value);
-			auto endNT = findJumpChainEnd(src, targetNotTaken, src.disasm(targetNotTaken), flags, true);
+			auto endNT = findJumpChainEnd(targetNotTaken, mBinary.disasm(targetNotTaken), flags, true);
 			if (!endNT)
 				endNT = targetNotTaken;
 
@@ -402,7 +411,7 @@ private:
 		{
 			auto taken = flags.isSet(cond) == value;
 			auto target = taken ? targetTaken : targetNotTaken;
-			auto end = findJumpChainEnd(src, target, src.disasm(target), flags, true);
+			auto end = findJumpChainEnd(target, mBinary.disasm(target), flags, true);
 			return end ? end : target;
 		}
 	}
@@ -479,36 +488,47 @@ private:
 		}
 	}
 
-	void applyPatches()
+	void applyPatches(const std::vector<rva_t>& hltRVAs, const std::vector<rva_t>& jumpPatchRVAs)
 	{
+		// help ida - replace 'hlt' with 'icebp'
+		for (auto rva : hltRVAs)
+		{
+			mBinary.bytes()[rva] = 0xF1;
+		}
+
+		// patch jumps
+		for (auto rva : jumpPatchRVAs)
+		{
+			auto next = mBlocks.findNext(rva);
+			auto block = mBlocks.getPrevIfContains(next, rva);
+			ensure(block != mBlocks.end() && block->end == rva + 1 && !block->instructions.empty() && block->instructions.back() == rva && block->successors.size() == 1 && block->successors.front().flags == (EdgeFlags::Unconditional | EdgeFlags::PatchedChain));
+			auto target = block->successors.front().rva;
+			auto longJmp = target > rva + 129 || target < rva - 126;
+			auto actualEnd = block->end + (longJmp ? sizeof(int) : sizeof(char));
+			i32 jumpDelta = target - actualEnd;
+			if (longJmp)
+			{
+				mBinary.bytes()[rva] = 0xE9;
+				*(i32*)(mBinary.bytes().data() + block->end) = jumpDelta;
+			}
+			else
+			{
+				mBinary.bytes()[rva] = 0xEB;
+				*(i8*)(mBinary.bytes().data() + block->end) = jumpDelta;
+			}
+			mBlocks.extend(block->end, actualEnd, next);
+		}
+
+		// patch space between blocks with nops
 		auto junkStart = mStartRVA;
 		auto junkify = [&](rva_t goodRVA) {
-			if (goodRVA < junkStart)
-				throw std::exception("WTF");
+			ensure(goodRVA >= junkStart);
 			memset(mBinary.bytes().data() + junkStart, 0x90, goodRVA - junkStart);
 		};
-
 		for (auto& block : mBlocks)
 		{
 			junkify(block.begin);
 			junkStart = block.end;
-			if (block.successorNeedsPatching())
-			{
-				auto target = block.successors.front();
-				auto longJmp = target > block.end + 129 || target < block.end - 126;
-				junkStart += longJmp ? 5 : 2;
-				i32 jumpDelta = target - junkStart;
-				if (longJmp)
-				{
-					mBinary.bytes()[block.end] = 0xE9;
-					*(i32*)(mBinary.bytes().data() + block.end + 1) = jumpDelta;
-				}
-				else
-				{
-					mBinary.bytes()[block.end] = 0xEB;
-					*(i8*)(mBinary.bytes().data() + block.end + 1) = jumpDelta;
-				}
-			}
 		}
 		junkify(mEndRVA);
 	}
@@ -520,7 +540,6 @@ private:
 	rva_t mStartRVA = 0;
 	rva_t mEndRVA = 0;
 	RangeMap<Block> mBlocks;
-	std::vector<Reference> mCalls; // external calls, sorted by instruction RVAs
 	std::vector<Reference> mRefs; // rip-relative references, sorted by instruction RVAs
 };
 

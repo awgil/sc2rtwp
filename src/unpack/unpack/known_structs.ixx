@@ -10,19 +10,19 @@ export struct SectionRemapInfo
 };
 static_assert(sizeof(SectionRemapInfo) == 0xC);
 
-export struct EncryptedPageRegion
+export struct AddressSizePair
 {
 	u32 rva;
 	u32 size;
 };
-static_assert(sizeof(EncryptedPageRegion) == 0x8);
+static_assert(sizeof(AddressSizePair) == 0x8);
 
 export struct BootstrapInfo
 {
 	u32 f0;
 	u32 rvaEntryPoint;
 	SectionRemapInfo sections[32];
-	EncryptedPageRegion pageRegions[32];
+	AddressSizePair pageRegions[32];
 	char f288[256];
 	u32 textRVA;
 	u32 textSize;
@@ -105,7 +105,7 @@ export struct AntitamperStaticState
 	u64 vehDecryptionDone; // initially 0, set to some constant when obfuscate() is decrypted
 	u64 pad2;
 
-	u64 relocationsStraddlingPageBoundary[128];
+	AddressSizePair relocationsStraddlingPageBoundary[128];
 	u32 relocationsStraddlingPageBoundaryCount;
 	u32 pad3[3];
 

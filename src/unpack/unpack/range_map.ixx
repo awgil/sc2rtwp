@@ -61,7 +61,7 @@ public:
 	// if hint is provided, it should point to the next entry
 	void insert(Entry&& e, auto hint)
 	{
-		ensure(e.begin <= e.end);
+		ensure(e.begin < e.end);
 		ensure(hint == mEntries.end() || hint->begin >= e.end);
 		ensure(hint == mEntries.begin() || (hint - 1)->end <= e.begin);
 		mEntries.emplace(hint, std::move(e));
@@ -79,6 +79,7 @@ public:
 	// if specified, hint should be an iterator for next entry (i.e. equal to findNext(begin))
 	void extend(const Key& begin, const Key& end, auto hint)
 	{
+		ensure(begin < end);
 		ensure(hint != mEntries.begin()); // should have something to extend
 		ensure(hint == mEntries.end() || hint->begin >= end); // should not create overlap
 		auto& extended = mEntries[hint - mEntries.begin() - 1];
@@ -92,13 +93,13 @@ public:
 	{
 		ensure(begin >= iter->begin);
 		ensure(end <= iter->end);
-		ensure(begin <= end);
+		ensure(begin < end);
 		edit(iter).begin = begin;
 		edit(iter).end = end;
 	}
 
 private:
-	std::vector<Entry> mEntries; // invariant: [i].begin <= [i].end <= [i+1].begin
+	std::vector<Entry> mEntries; // invariant: [i].begin < [i].end <= [i+1].begin
 };
 
 // simple range map with optional payload

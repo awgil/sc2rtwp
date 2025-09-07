@@ -161,8 +161,8 @@ private:
 	void processBootstrapStart()
 	{
 		auto& start = mFuncs.process(mBinary.entryPoint(), "bootstrapStart");
-		ensure(start.calls().empty());
 		matchDataFieldRefs(start, &BootstrapStartState::stage);
+		matchTextReferences(start);
 		ensure(mBSS.address() - mSectionData.begin == 0x60); // not sure what's there before it and how likely is it to change...
 	}
 
@@ -177,20 +177,22 @@ private:
 			&AntitamperStaticState::xorConstants,
 			&AntitamperStaticState::supportSSE, // processor caps flags
 			&AntitamperStaticState::pageHashUsesAVX2); // last flag
-		ensure(tlsInitial.calls().empty());
 		matchTextReferences(tlsInitial, mTLSRuntime, mTLSDecode, mTLSFixup);
 		// note: RTTI between tls directory and antidebug static ?..
 		// TODO-UNPACK: only really need to write out processor caps; xor constants should be left as zeros...
 
 		// main decoding tls callback
-		auto& tlsDecode = mFuncs.process(mTLSDecode.address(), "bootstrapTLSDecode");
-		matchDataFieldRefs(tlsDecode, &BootstrapStartState::stage);
-		ensure(tlsDecode.calls().size() == 1);
-
-		auto& tlsDecodeImpl = mFuncs.process(tlsDecode.calls()[0].refRVA, "bootstrapTLSImpl");
+		auto& tlsDecodeImpl = processWrapperFunc(mTLSDecode.address(), "bootstrapTLSDecode", &BootstrapStartState::stage);
 		// TODO: rest...
 
-		processVEH(tlsDecodeImpl.calls()[0].refRVA);
+		auto iRef = tlsDecodeImpl.refs().begin();
+		matchDataFieldRef(tlsDecodeImpl, *iRef++, &AntitamperStaticState::bootstrapRegionHash);
+		matchDataFieldRef(tlsDecodeImpl, *iRef++, &AntitamperStaticState::bootstrapRegionHashMismatch);
+		ensure(iRef++->refRVA == 0); // this is kinda bad, this is used to fill relocationsStraddlingPageBoundary
+		matchDataFieldRef(tlsDecodeImpl, *iRef++, &AntitamperStaticState::relocationsStraddlingPageBoundaryCount);
+		processVEH(iRef++->refRVA);
+		dumpRefs(tlsDecodeImpl);
+		ensure(iRef == tlsDecodeImpl.refs().end());
 	}
 
 	// process everything related to VEH - it deals with creating one of the obfuscate() variants
@@ -211,13 +213,8 @@ private:
 			mXorUnmapViewOfFile,
 			mXorRemoveVectoredExceptionHandler);
 		matchTextReferences(setupVEH, mVEHMain);
-		ensure(setupVEH.calls().empty());
 
-		auto& vehMain = mFuncs.process(mVEHMain.address(), "bootstrapVEHMain");
-		ensure(vehMain.refs().empty());
-		ensure(vehMain.calls().size() == 1);
-
-		auto& vehMainImpl = mFuncs.process(vehMain.calls()[0].refRVA, "bootstrapVEHMainImpl");
+		auto& vehMainImpl = processWrapperFunc(mVEHMain.address(), "bootstrapVEHMain");
 		matchDataFieldRefs(vehMainImpl,
 			&AntitamperStaticState::bootstrapVEHInvocationCount, // comparison, reset & increment
 			&AntitamperStaticState::bootstrapVEHInvocationCount,
@@ -241,22 +238,21 @@ private:
 			&BootstrapStartState::vehVal9,
 			&BootstrapStartState::vehVal9,
 			&BootstrapStartState::vehVal9);
-		matchTextReferences(vehMainImpl, mVEHHashRegionEnd, mVEHHashRegionStart, mVEHContinuationFail);
+		matchNonCallTextReferences(vehMainImpl, mVEHHashRegionEnd, mVEHHashRegionStart, mVEHContinuationFail);
 
 		ensure(mVEHHashRegionEnd.address() > mVEHHashRegionStart.address());
 
 		auto& vehContinuationFail = mFuncs.process(mVEHContinuationFail.address(), "bootstrapVEHContinuationFail");
 		ensure(vehContinuationFail.refs().empty());
-		ensure(vehContinuationFail.calls().empty());
 
-		ensure(vehMainImpl.calls().size() == 15);
-		for (int i = 0; i < vehMainImpl.calls().size(); ++i)
-			processVEHSub(vehMainImpl.calls()[i].refRVA, i + 1);
+		for (auto [i, call] : std::ranges::views::enumerate(vehMainImpl.calls()))
+			processVEHSub(call.refRVA, i + 1);
 	}
 
 	// note: index is 1-based for legacy reasons (that's how i called subfunctions while reversing)
 	void processVEHSub(rva_t rva, int index)
 	{
+		ensure(index > 0 && index <= 15);
 		auto& vehSub = mFuncs.process(rva, std::format("bootstrapVEHSub{}", index));
 		// all VEH sub-functions are built similarly:
 		// if (gLastExcInfo.get()->Context->Dr7) goto fail; // prologue data access #1
@@ -272,7 +268,6 @@ private:
 		// }
 		// ++gNumCallsN; // epiligue data access #6
 		// return false;
-		ensure(vehSub.calls().empty());
 		ensure(vehSub.refs().size() >= 9);
 		auto iRef = vehSub.refs().begin();
 
@@ -338,6 +333,8 @@ private:
 			ensure(mSectionRData.contains(iRef++->refRVA)); // gCodeSection.size
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::xorredSectionMapping);
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::vehDecryptionDone); // TODO: store constant?..
+			if (mSectionText.contains(iRef->refRVA))
+				++iRef; // sometimes compiler might reload address of obfuscate function here...
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::xorConstants);
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::obfuscateFunctionHash);
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::obfuscateUnk);
@@ -355,10 +352,30 @@ private:
 		ensure(iRef == vehSub.refs().end());
 	}
 
+	template<typename... Fields>
+	FunctionInfo& processWrapperFunc(rva_t wrapperRVA, const std::string& name, Fields&&... dataRefs)
+	{
+		auto& wrapper = mFuncs.process(wrapperRVA, name);
+		matchDataFieldRefs(wrapper, std::forward<Fields>(dataRefs)...);
+		ResolvedAddress implAddr;
+		matchTextReferences(wrapper, implAddr);
+
+		return mFuncs.process(implAddr.address(), name + "Impl");
+	}
+
 	template<typename... R>
 	void matchTextReferences(const FunctionInfo& func, R&... refs)
 	{
 		auto range = func.refsToSection(mSectionText);
+		auto it = range.begin();
+		(refs.resolve(it++->refRVA), ...);
+		ensure(it == range.end());
+	}
+
+	template<typename... R>
+	void matchNonCallTextReferences(const FunctionInfo& func, R&... refs)
+	{
+		auto range = func.refsToSection(mSectionText) | std::ranges::views::filter([](const auto& ref) { return ref.type != FunctionInfo::ReferenceType::Call; });
 		auto it = range.begin();
 		(refs.resolve(it++->refRVA), ...);
 		ensure(it == range.end());
@@ -389,6 +406,19 @@ private:
 
 	template<typename T> ResolvedGlobalAddress<BootstrapStartState>& fieldResolver(T (BootstrapStartState::*)) { return mBSS; }
 	template<typename T> ResolvedGlobalAddress<AntitamperStaticState>& fieldResolver(T (AntitamperStaticState::*)) { return mASS; }
+
+	void dumpRefs(const FunctionInfo& func)
+	{
+		for (auto& ref : func.refs())
+		{
+			if (ref.refRVA >= mBSS.address() && ref.refRVA < mBSS.address() + sizeof(BootstrapStartState))
+				std::println("> BSS + 0x{:X}", ref.refRVA - mBSS.address());
+			else if (ref.refRVA >= mASS.address() && ref.refRVA < mASS.address() + sizeof(AntitamperStaticState))
+				std::println("> ASS + 0x{:X}", ref.refRVA - mASS.address());
+			else
+				std::println("> {}", mBinary.formatRVA(ref.refRVA));
+		}
+	}
 
 private:
 	PEBinary mBinary;
