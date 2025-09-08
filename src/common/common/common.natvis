@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+
+  <Type Name="SmallVector&lt;*&gt;">
+    <DisplayString>{{ size={mSize} }}</DisplayString>
+    <Expand>
+      <Item Name="[capacity]">mBuffer.mCapacity</Item>
+      <ArrayItems Condition="mBuffer.mCapacity &lt;= $T2">
+        <Size>mSize</Size>
+        <ValuePointer>($T1*)&amp;mBuffer.mEmbedded</ValuePointer>
+      </ArrayItems>
+      <ArrayItems Condition="mBuffer.mCapacity &gt; $T2">
+        <Size>mSize</Size>
+        <ValuePointer>mBuffer.mExternal</ValuePointer>
+      </ArrayItems>
+    </Expand>
+  </Type>
+
+  <Type Name="x86_op_mem">
+    <DisplayString Condition="segment == 0 &amp;&amp; index == 0 &amp;&amp; disp == 0" ExcludeView="rva">[{base,en}]</DisplayString>
+    <DisplayString Condition="segment == 0 &amp;&amp; index == 0 &amp;&amp; disp &gt; 0" ExcludeView="rva">[{base,en} + {disp,x}]</DisplayString>
+    <DisplayString Condition="segment == 0 &amp;&amp; index == 0 &amp;&amp; disp &lt; 0" ExcludeView="rva">[{base,en} - {-disp,x}]</DisplayString>
+    <DisplayString Condition="segment == 0 &amp;&amp; index != 0 &amp;&amp; disp == 0" ExcludeView="rva">[{base,en} + {scale,d} * {index,en}]</DisplayString>
+    <DisplayString Condition="segment == 0 &amp;&amp; index != 0 &amp;&amp; disp &gt; 0" ExcludeView="rva">[{base,en} + {scale,d} * {index,en} + {disp,x}]</DisplayString>
+    <DisplayString Condition="segment == 0 &amp;&amp; index != 0 &amp;&amp; disp &lt; 0" ExcludeView="rva">[{base,en} + {scale,d} * {index,en} - {-disp,x}]</DisplayString>
+    <DisplayString Condition="segment != 0 &amp;&amp; index == 0 &amp;&amp; disp == 0" ExcludeView="rva">{segment,en}:[{base,en}]</DisplayString>
+    <DisplayString Condition="segment != 0 &amp;&amp; index == 0 &amp;&amp; disp &gt; 0" ExcludeView="rva">{segment,en}:[{base,en} + {disp,x}]</DisplayString>
+    <DisplayString Condition="segment != 0 &amp;&amp; index == 0 &amp;&amp; disp &lt; 0" ExcludeView="rva">{segment,en}:[{base,en} - {-disp,x}]</DisplayString>
+    <DisplayString Condition="segment != 0 &amp;&amp; index != 0 &amp;&amp; disp == 0" ExcludeView="rva">{segment,en}:[{base,en} + {scale,d} * {index,en}]</DisplayString>
+    <DisplayString Condition="segment != 0 &amp;&amp; index != 0 &amp;&amp; disp &gt; 0" ExcludeView="rva">{segment,en}:[{base,en} + {scale,d} * {index,en} + {disp,x}]</DisplayString>
+    <DisplayString Condition="segment != 0 &amp;&amp; index != 0 &amp;&amp; disp &lt; 0" ExcludeView="rva">{segment,en}:[{base,en} + {scale,d} * {index,en} - {-disp,x}]</DisplayString>
+    <DisplayString Condition="index == 0" IncludeView="rva">[rva {disp,x}]</DisplayString>
+    <DisplayString Condition="index != 0" IncludeView="rva">[rva {disp,x} + {scale,d} * {index,en}]</DisplayString>
+  </Type>
+
+  <Type Name="Instruction">
+    <DisplayString Condition="opcount == 0">{rva,x}: {mnem,en}</DisplayString>
+    <DisplayString Condition="opcount == 1 &amp;&amp; ops[0].type == OperandType::Reg">{rva,x}: {mnem,en} {ops[0].reg,en}</DisplayString>
+    <DisplayString Condition="opcount == 1 &amp;&amp; ops[0].type == OperandType::Imm">{rva,x}: {mnem,en} {imm}</DisplayString>
+    <DisplayString Condition="opcount == 1 &amp;&amp; ops[0].type == OperandType::ImmRVA">{rva,x}: {mnem,en} rva {imm,x}</DisplayString>
+    <DisplayString Condition="opcount == 1 &amp;&amp; ops[0].type == OperandType::Mem">{rva,x}: {mnem,en} {mem}</DisplayString>
+    <DisplayString Condition="opcount == 1 &amp;&amp; ops[0].type == OperandType::MemRVA">{rva,x}: {mnem,en} {mem,view(rva)}</DisplayString>
+    <DisplayString Condition="opcount == 2 &amp;&amp; ops[0].type == OperandType::Reg &amp;&amp; ops[1].type == OperandType::Reg">{rva,x}: {mnem,en} {ops[0].reg,en}, {ops[1].reg,en} </DisplayString>
+    <DisplayString Condition="opcount == 2 &amp;&amp; ops[0].type == OperandType::Mem &amp;&amp; ops[1].type == OperandType::Reg">{rva,x}: {mnem,en} {mem}, {ops[1].reg,en} </DisplayString>
+    <DisplayString Condition="opcount == 2 &amp;&amp; ops[0].type == OperandType::MemRVA &amp;&amp; ops[1].type == OperandType::Reg">{rva,x}: {mnem,en} {mem,view(rva)}, {ops[1].reg,en} </DisplayString>
+    <DisplayString Condition="opcount == 2 &amp;&amp; ops[0].type == OperandType::Reg &amp;&amp; ops[1].type == OperandType::Imm">{rva,x}: {mnem,en} {ops[0].reg,en}, {imm} </DisplayString>
+    <DisplayString Condition="opcount == 2 &amp;&amp; ops[0].type == OperandType::Reg &amp;&amp; ops[1].type == OperandType::Mem">{rva,x}: {mnem,en} {ops[0].reg,en}, {mem} </DisplayString>
+    <DisplayString Condition="opcount == 2 &amp;&amp; ops[0].type == OperandType::Reg &amp;&amp; ops[1].type == OperandType::MemRVA">{rva,x}: {mnem,en} {ops[0].reg,en}, {mem,view(rva)} </DisplayString>
+    <DisplayString Condition="opcount == 2 &amp;&amp; ops[0].type == OperandType::Mem &amp;&amp; ops[1].type == OperandType::Imm">{rva,x}: {mnem,en} {mem}, {imm} </DisplayString>
+    <DisplayString Condition="opcount == 2 &amp;&amp; ops[0].type == OperandType::MemRVA &amp;&amp; ops[1].type == OperandType::Imm">{rva,x}: {mnem,en} {mem,view(rva)}, {imm} </DisplayString>
+    <DisplayString Condition="opcount == 3 &amp;&amp; ops[0].type == OperandType::Reg &amp;&amp; ops[1].type == OperandType::Reg &amp;&amp; ops[2].type == OperandType::Imm">{rva,x}: {mnem,en} {ops[0].reg,en} {ops[1].reg,en} {imm}</DisplayString>
+    <DisplayString Condition="opcount == 1">{rva,x}: {mnem,en} {ops[0].type,en}</DisplayString>
+    <DisplayString Condition="opcount == 2">{rva,x}: {mnem,en} {ops[0].type,en} {ops[1].type,en}</DisplayString>
+    <DisplayString Condition="opcount == 3">{rva,x}: {mnem,en} {ops[0].type,en} {ops[1].type,en} {ops[2].type,en}</DisplayString>
+    <DisplayString Condition="opcount == 4">{rva,x}: {mnem,en} {ops[0].type,en} {ops[1].type,en} {ops[2].type,en} {ops[3].type,en}</DisplayString>
+    <Expand>
+      <Item Name="rva">rva,x</Item>
+      <Item Name="mnem">mnem,en</Item>
+      <Synthetic Name="op0" Condition="opcount &gt; 0">
+        <DisplayString Condition="ops[0].type == OperandType::Reg">{ops[0].reg,en}</DisplayString>
+        <DisplayString Condition="ops[0].type == OperandType::Imm">{imm}</DisplayString>
+        <DisplayString Condition="ops[0].type == OperandType::ImmRVA">rva {imm,x}</DisplayString>
+        <DisplayString Condition="ops[0].type == OperandType::Mem">{mem}</DisplayString>
+        <DisplayString Condition="ops[0].type == OperandType::MemRVA">{mem,view(rva)}</DisplayString>
+        <Expand>
+          <ExpandedItem>ops[0]</ExpandedItem>
+        </Expand>
+      </Synthetic>
+      <Synthetic Name="op1" Condition="opcount &gt; 1">
+        <DisplayString Condition="ops[1].type == OperandType::Reg">{ops[1].reg,en}</DisplayString>
+        <DisplayString Condition="ops[1].type == OperandType::Imm">{imm}</DisplayString>
+        <DisplayString Condition="ops[1].type == OperandType::ImmRVA">rva {imm,x}</DisplayString>
+        <DisplayString Condition="ops[1].type == OperandType::Mem">{mem}</DisplayString>
+        <DisplayString Condition="ops[1].type == OperandType::MemRVA">{mem,view(rva)}</DisplayString>
+        <Expand>
+          <ExpandedItem>ops[1]</ExpandedItem>
+        </Expand>
+      </Synthetic>
+      <Synthetic Name="op2" Condition="opcount &gt; 2">
+        <DisplayString Condition="ops[2].type == OperandType::Reg">{ops[2].reg,en}</DisplayString>
+        <DisplayString Condition="ops[2].type == OperandType::Imm">{imm}</DisplayString>
+        <DisplayString Condition="ops[2].type == OperandType::ImmRVA">rva {imm,x}</DisplayString>
+        <DisplayString Condition="ops[2].type == OperandType::Mem">{mem}</DisplayString>
+        <DisplayString Condition="ops[2].type == OperandType::MemRVA">{mem,view(rva)}</DisplayString>
+        <Expand>
+          <ExpandedItem>ops[2]</ExpandedItem>
+        </Expand>
+      </Synthetic>
+      <Synthetic Name="op3" Condition="opcount &gt; 3">
+        <DisplayString Condition="ops[3].type == OperandType::Reg">{ops[3].reg,en}</DisplayString>
+        <DisplayString Condition="ops[3].type == OperandType::Imm">{imm}</DisplayString>
+        <DisplayString Condition="ops[3].type == OperandType::ImmRVA">rva {imm,x}</DisplayString>
+        <DisplayString Condition="ops[3].type == OperandType::Mem">{mem}</DisplayString>
+        <DisplayString Condition="ops[3].type == OperandType::MemRVA">{mem,view(rva)}</DisplayString>
+        <Expand>
+          <ExpandedItem>ops[3]</ExpandedItem>
+        </Expand>
+      </Synthetic>
+    </Expand>
+  </Type>
+
+</AutoVisualizer>

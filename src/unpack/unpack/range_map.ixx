@@ -23,13 +23,16 @@ public:
 	using Key = typename Entry::Key;
 	static_assert(std::is_base_of_v<RangeMapEntry<Key>, Entry>);
 
+	auto begin() { return mEntries.begin(); }
 	auto begin() const { return mEntries.begin(); }
+	auto end() { return mEntries.end(); }
 	auto end() const { return mEntries.end(); }
 	auto size() const { return mEntries.size(); }
 	auto empty() const { return mEntries.empty(); }
 	auto& front() const { return mEntries.front(); }
 	auto& back() const { return mEntries.back(); }
 	void clear() { mEntries.clear(); }
+	auto& operator[](size_t i) { return mEntries[i]; }
 	auto& operator[](size_t i) const { return mEntries[i]; }
 
 	// return mutable reference to the entry iterator points to; note that begin/end should not be modified, to ensure invariant is preserved

@@ -43,50 +43,48 @@ public:
 template<typename T> T getSimpleXorConstant(PEBinary& bin, const FunctionInfo& func, const FunctionInfo::Reference& ref)
 {
 	auto block = ensure(func.findBlock(ref.insnRVA));
-	auto it = std::ranges::find(block->instructions, ref.insnRVA);
+	auto it = block->findInstruction(ref.insnRVA);
 	ensure(it != block->instructions.end());
 	// supported sequences:
 	//                            xor r1, const; mov mem, r1
 	// mov r2, const;             xor r1, r2;    mov mem, r1
 	// mov r2, const; mov r1, r3; xor r1, r2;    mov mem, r1
-	ensure(block->instructions.size() >= 3 && it >= block->instructions.begin() + 2);
 
 	T constant = 0;
-	auto insn = ensure(bin.disasm(ref.insnRVA));
-	ensure(insn->id == X86_INS_MOV && insn->detail->x86.op_count == 2 && insn->detail->x86.operands[0].type == X86_OP_MEM && insn->detail->x86.operands[1].type == X86_OP_REG);
-	auto finalReg = insn->detail->x86.operands[1].reg;
+	ensure(it->mnem == X86_INS_MOV && it->opcount == 2 && (it->ops[0].type == OperandType::Mem || it->ops[0].type == OperandType::MemRVA) && it->ops[1].type == OperandType::Reg);
+	auto finalReg = it->ops[1].reg;
 
 	ensure(it != block->instructions.begin());
-	insn = ensure(bin.disasm(*--it));
-	ensure(insn->id == X86_INS_XOR && insn->detail->x86.op_count == 2 && insn->detail->x86.operands[0].type == X86_OP_REG && insn->detail->x86.operands[0].reg == finalReg);
-	if (insn->detail->x86.operands[1].type == X86_OP_IMM)
+	--it;
+	ensure(it->mnem == X86_INS_XOR && it->opcount == 2 && it->ops[0].type == OperandType::Reg && it->ops[0].reg == finalReg);
+	if (it->ops[1].type == OperandType::Imm)
 	{
 		// simple form, xor with immediate
-		constant = static_cast<T>(insn->detail->x86.operands[1].imm);
+		constant = static_cast<T>(it->imm);
 	}
-	else if (insn->detail->x86.operands[1].type == X86_OP_REG)
+	else if (it->ops[1].type == OperandType::Reg)
 	{
-		auto interReg = insn->detail->x86.operands[1].reg;
+		auto interReg = it->ops[1].reg;
 
 		ensure(it != block->instructions.begin());
-		insn = ensure(bin.disasm(*--it));
-		while (insn->id == X86_INS_MOV)
+		--it;
+		while (it->mnem == X86_INS_MOV)
 		{
-			ensure(insn->detail->x86.op_count == 2 && insn->detail->x86.operands[0].type == X86_OP_REG && insn->detail->x86.operands[1].type == X86_OP_REG);
-			if (finalReg == insn->detail->x86.operands[0].reg)
-				finalReg = insn->detail->x86.operands[1].reg;
-			else if (interReg == insn->detail->x86.operands[0].reg)
-				interReg = insn->detail->x86.operands[1].reg;
+			ensure(it->opcount == 2 && it->ops[0].type == OperandType::Reg && it->ops[1].type == OperandType::Reg);
+			if (finalReg == it->ops[0].reg)
+				finalReg = it->ops[1].reg;
+			else if (interReg == it->ops[0].reg)
+				interReg = it->ops[1].reg;
 			else
 				throw std::exception("Unexpected mov");
 
 			ensure(it != block->instructions.begin());
-			insn = ensure(bin.disasm(*--it));
+			--it;
 		}
 
-		ensure(insn->id == X86_INS_MOVABS && insn->detail->x86.op_count == 2 && insn->detail->x86.operands[0].type == X86_OP_REG && insn->detail->x86.operands[1].type == X86_OP_IMM);
-		ensure(insn->detail->x86.operands[0].reg == interReg || insn->detail->x86.operands[0].reg == finalReg);
-		constant = static_cast<T>(insn->detail->x86.operands[1].imm);
+		ensure(it->mnem == X86_INS_MOVABS && it->opcount == 2 && it->ops[0].type == OperandType::Reg && it->ops[1].type == OperandType::Imm);
+		ensure(it->ops[0].reg == interReg || it->ops[0].reg == finalReg);
+		constant = static_cast<T>(it->imm);
 	}
 	else
 	{

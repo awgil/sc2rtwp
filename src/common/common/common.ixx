@@ -7,3 +7,4 @@ export import :smart_handle;
 export import :pipe;
 export import :virtual_mem;
 export import :process;
+export import :small_vector;

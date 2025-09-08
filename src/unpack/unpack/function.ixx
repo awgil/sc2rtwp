@@ -101,209 +101,299 @@ export enum EdgeFlags : u8
 	Unconditional = 1 << 0, // the only edge in a block
 	PatchedChain = 1 << 1, // this is a jump that was represented by a chain in original code
 	Flow = 1 << 2, // immediately following instruction
-	Loop = 1 << 3, // jump to next iteration of a loop
+	Loop = 1 << 3, // jump to next iteration of a loop (TODO: remove maybe and replace with topological order...)
 	Indirect = 1 << 4, // part of switch statement
 };
 ADD_BITFIELD_OPS(EdgeFlags);
 
-export class FunctionInfo
+export enum class OperandType : u8
 {
-public:
+	Invalid, // not an operand
+	Reg,
+	Imm,
+	Mem,
+	ImmRVA, // immediate, to be treated as RVA (jump/call)
+	MemRVA, // memory; base is to be ignored (assumed 0), displacement is rva (rip-relative)
+};
+
+// TODO: improve..
+export struct Operand
+{
+	OperandType type;
+	u8 size;
+	x86_reg reg : 9; // only valid if type == Reg
+	cs_ac_type access : 7;
+};
+//static_assert(sizeof(Operand) == 4);
+
+// TODO: this can be seriously improved (eg max 1 memory access, max 1 displacement, ...)
+export struct Instruction
+{
+	rva_t rva;
+	x86_insn mnem;
+	u8 opcount;
+	Operand ops[4];
+	x86_op_mem mem; // data for memory operand (if any)
+	int64_t imm; // immediate operand value (if any)
+
+	std::span<Operand> operands() { return { ops, opcount }; }
+};
+
+// edge between two blocks
+export struct FunctionEdge
+{
+	int block; // index of the block; note that while blocks are being built, this stores RVA instead!
+	EdgeFlags flags;
+};
+
+export struct FunctionBlock : RangeMapEntry<rva_t>
+{
+	std::vector<Instruction> instructions;
+	SmallVector<FunctionEdge, 2> successors; // can be empty (if block ends with return / tail recursion jump), contain 1 entry (unconditional jump), 2 entries (conditional jump + implicit flow) or multiple entries (switch); sorted
+	SmallVector<FunctionEdge, 2> predecessors; // note: optionally filled in...
+
+	auto findInstruction(rva_t rva) const { return std::ranges::find_if(instructions, [rva](const auto& isn) { return isn.rva == rva; }); }
+};
+
+// first pass of function analysis
+// responsible for finding all function blocks, patching out jump chains to normal jumps, and helping out ida (filling junk between blocks with nops, replacing hlt with some other placeholder instruction)
+class FunctionBlockAnalysis
+{
 	enum class InstructionType
 	{
 		Normal,
 		ActualNop, // some form of real nop instruction
 		EffectiveNop, // special form of nop used as filler in jump chains: "s[ha][lr] x,0", "xchg/mov reg,reg"
 		FlagsOnly, // instructions that only modify flags and are used in jump chains: "[x]or x,0", "and x,~0", "test x,y", "clc/stc"
-		Ret, // ret
+		Ret, // ret or some other instruction that exits function
 		JumpUnconditional, // jmp
 		JumpConditional, // jcc
-		CallDirect, // call addr
 		Halt, // hlt - this is used by bootstrap code to kick off VEH operation
 	};
 
-	// edge between two blocks
-	struct Edge
+public:
+	FunctionBlockAnalysis(PEBinary& binary, rva_t begin, rva_t end, bool sureAboutEnd)
+		: mBinary(binary), mBegin(begin), mEnd(end)
 	{
-		rva_t rva;
-		EdgeFlags flags;
-	};
+		mPendingBlockStarts.push_back(begin);
+		while (!mPendingBlockStarts.empty())
+		{
+			auto rva = mPendingBlockStarts.back();
+			mPendingBlockStarts.pop_back();
+			analyzeBlock(rva);
+		}
+		fixupBlockEdges();
+		applyPatches(sureAboutEnd);
+	}
 
-	struct Block : RangeMapEntry<rva_t>
+	auto&& result() { return std::move(mBlocks); }
+
+private:
+	void analyzeBlock(rva_t rva)
 	{
-		std::vector<rva_t> instructions;
-		std::vector<Edge> successors; // can be empty (if block ends with return / tail recursion jump), contain 1 entry (unconditional jump), 2 entries (conditional jump, first entry is implicit flow) or multiple entries (switch)
-	};
+		auto nextBlock = mBlocks.findNext(rva);
+		auto existing = mBlocks.getPrevIfContains(nextBlock, rva);
+		if (existing == mBlocks.end())
+		{
+			// disassemble new block...
+			auto maxBlockEnd = nextBlock != mBlocks.end() ? nextBlock->begin : mEnd;
+			auto newBlock = analyzeNewBlock(rva, maxBlockEnd);
+			ensure(newBlock.end <= maxBlockEnd);
+			mBlocks.insert(std::move(newBlock), nextBlock);
+		}
+		else if (existing->begin != rva)
+		{
+			// split existing block
+			auto isn = existing->findInstruction(rva);
+			ensure(isn != existing->instructions.end());
 
-	enum class ReferenceType
+			FunctionBlock pred{ existing->begin, rva };
+			pred.instructions.assign(existing->instructions.begin(), isn);
+			mBlocks.edit(existing).instructions.erase(existing->instructions.begin(), isn);
+			pred.successors.push_back({ rva, EdgeFlags::Flow });
+			mBlocks.shrink(rva, existing->end, existing);
+			mBlocks.insert(std::move(pred), nextBlock - 1);
+		}
+		// else: this block was already processed, nothing to do here...
+	}
+
+	FunctionBlock analyzeNewBlock(rva_t rva, rva_t maxBlockEnd)
 	{
-		Unknown,
-		Address, // lea
-		Read, // operand 1+
-		Write, // operand 0 (can be read-write)
-		Call, // normal call or tail-recursion jmp
-	};
+		FunctionBlock newBlock{ rva, rva };
+		while (true)
+		{
+			auto isn = ensure(mBinary.disasm(rva));
+			newBlock.instructions.push_back(createInstruction(rva, isn));
+			newBlock.end = rva + isn->size;
 
-	// a RIP-relative reference to some external executable item (function, piece of data, etc)
-	struct Reference
-	{
-		rva_t insnRVA;
-		rva_t refRVA;
-		ReferenceType type;
-	};
-
-	FunctionInfo(PEBinary& src, rva_t funcStartRVA, std::string_view name)
-		: mBinary(src)
-		, mName(name)
-		, mSEHEntry(src.findSEHEntry(funcStartRVA))
-		, mStartRVA(funcStartRVA)
-		, mEndRVA(mSEHEntry ? mSEHEntry->end : src.bytes().size())
-	{
-		if (name.length() > 0)
-			std::println("Processing function {} at {}", name, src.formatRVA(funcStartRVA));
-
-		if (mSEHEntry && mSEHEntry->begin != funcStartRVA)
-			throw std::exception("RVA is mid function");
-
-		std::vector<rva_t> blockStartRVAs{ funcStartRVA };
-		auto queueJumpTargetRVA = [&](Block& block, rva_t rva, EdgeFlags flags, rva_t predecessorRVA) {
-			//std::println("> scheduling [{:X}] {:X} -> {:X}", block.startRVA, predecessorRVA, rva);
-			blockStartRVAs.push_back(rva);
-			block.successors.push_back({ rva, flags });
-		};
-		auto queueJumpTarget = [&](Block& block, cs_insn* insn) {
-			if (insn->detail->x86.operands[0].type == X86_OP_IMM)
+			auto cat = categorizeInstruction(isn);
+			if (cat == InstructionType::Ret)
 			{
-				// TODO: process tail recursion jumps...
-				auto flags = insn->id == X86_INS_JMP ? EdgeFlags::Unconditional : EdgeFlags::None;
-				queueJumpTargetRVA(block, mBinary.vaToRVA(insn->detail->x86.operands[0].imm), flags, mBinary.vaToRVA(insn->address));
+				break;
+			}
+			if (cat == InstructionType::JumpUnconditional)
+			{
+				processJump(newBlock);
+				break;
+			}
+			if (cat == InstructionType::EffectiveNop || cat == InstructionType::FlagsOnly || cat == InstructionType::JumpConditional)
+			{
+				auto chainEnd = findJumpChainEnd(rva, isn, {});
+				if (chainEnd != 0)
+				{
+					u8 width = (chainEnd > rva + 129 || chainEnd < rva - 126) ? 4 : 1;
+					newBlock.instructions.back() = { rva, X86_INS_JMP, 1, { { OperandType::ImmRVA, width, X86_REG_INVALID } }, {}, chainEnd };
+					newBlock.end = rva + 1; // will be patched; keeping it as 1 ensures that next byte can be reused for some other jump chain
+					mJumpChains.push_back(rva);
+					processJump(newBlock);
+					break;
+				}
+			}
+			if (cat == InstructionType::JumpConditional)
+			{
+				newBlock.successors.push_back({ newBlock.end, EdgeFlags::Flow }); // implicit flow edge should be first (before conditional jump)
+				processJump(newBlock);
+				mPendingBlockStarts.push_back(newBlock.end); // process flow edge first...
+				break;
+			}
+
+			if (cat == InstructionType::Halt)
+			{
+				mHalts.push_back(rva);
+			}
+
+			if (newBlock.end == maxBlockEnd)
+			{
+				// we've reached a point where someone else jumped to, end the block now
+				newBlock.successors.push_back({ newBlock.end, EdgeFlags::Flow });
+				break;
+			}
+
+			rva = newBlock.end; // decode next instruction
+		}
+		return newBlock;
+	}
+
+	Instruction createInstruction(rva_t rva, cs_insn* isn) const
+	{
+		std::span<cs_x86_op> operands{ isn->detail->x86.operands, isn->detail->x86.op_count };
+		Instruction result{ rva, static_cast<x86_insn>(isn->id), static_cast<u8>(operands.size()) };
+		if (result.opcount > 0)
+		{
+			ensure(result.opcount <= std::extent_v<decltype(Instruction::ops)>);
+			bool haveImm = false, haveMem = false;
+			for (size_t i = 0; i < result.opcount; ++i)
+			{
+				auto& op = operands[i];
+				ensure(!op.avx_bcast && !op.avx_zero_opmask);
+				switch (op.type)
+				{
+				case X86_OP_REG:
+					result.ops[i] = { OperandType::Reg, op.size, op.reg, op.access };
+					break;
+				case X86_OP_IMM:
+					ensure(!haveImm);
+					haveImm = true;
+					result.ops[i] = { OperandType::Imm, op.size, X86_REG_INVALID, op.access };
+					result.imm = op.imm;
+					break;
+				case X86_OP_MEM:
+					ensure(!haveMem);
+					haveMem = true;
+					result.ops[i] = { OperandType::Mem, op.size, X86_REG_INVALID, op.access };
+					result.mem = op.mem;
+					if (result.mem.base == X86_REG_RIP)
+					{
+						result.ops[i].type = OperandType::MemRVA;
+						result.mem.disp += rva + isn->size;
+					}
+					break;
+				}
+			}
+		}
+		// instruction-specific fixup
+		switch (result.mnem)
+		{
+		case X86_INS_NOP:
+			// multi-byte nop doesn't actually access any operands
+			result.opcount = 0;
+			break;
+		case X86_INS_CALL:
+		case X86_INS_JMP:
+		case X86_INS_JO:
+		case X86_INS_JNO:
+		case X86_INS_JS:
+		case X86_INS_JNS:
+		case X86_INS_JE:
+		case X86_INS_JNE:
+		case X86_INS_JB:
+		case X86_INS_JAE:
+		case X86_INS_JP:
+		case X86_INS_JNP:
+		case X86_INS_JBE:
+		case X86_INS_JA:
+		case X86_INS_JL:
+		case X86_INS_JGE:
+		case X86_INS_JLE:
+		case X86_INS_JG:
+			ensure(result.opcount == 1);
+			if (result.ops[0].type == OperandType::Imm)
+			{
+				result.ops[0].type = OperandType::ImmRVA;
+				result.imm = mBinary.vaToRVA(result.imm);
 			}
 			else
 			{
-				// TODO: process switches...
-				__debugbreak();
+				ensure(result.ops[0].type == OperandType::Reg); // is that right?..
 			}
-		};
-
-		std::vector<rva_t> hltRVAs, jumpPatchRVAs;
-		while (!blockStartRVAs.empty())
-		{
-			auto rva = blockStartRVAs.back();
-			blockStartRVAs.pop_back();
-
-			auto nextBlock = mBlocks.findNext(rva);
-			auto existing = mBlocks.getPrevIfContains(nextBlock, rva);
-			if (existing == mBlocks.end())
-			{
-				// disassemble new block...
-				auto maxBlockEnd = nextBlock != mBlocks.end() ? nextBlock->begin : mEndRVA;
-				Block newBlock{ rva, rva };
-				while (true)
-				{
-					auto isn = ensure(src.disasm(rva));
-
-					for (int iOp = 0; iOp < isn->detail->x86.op_count; ++iOp)
-					{
-						auto& op = isn->detail->x86.operands[iOp];
-						if (op.type == X86_OP_MEM && op.mem.base == X86_REG_RIP)
-						{
-							auto type = iOp == 0 ? ReferenceType::Write : isn->id == X86_INS_LEA ? ReferenceType::Address : ReferenceType::Read;
-							mRefs.push_back({ rva, static_cast<rva_t>(rva + isn->size + op.mem.disp), type });
-						}
-					}
-
-					newBlock.instructions.push_back(rva);
-					newBlock.end = rva + isn->size;
-					auto cat = categorizeInstruction(isn);
-					if (cat == InstructionType::Ret)
-					{
-						break;
-					}
-					if (cat == InstructionType::JumpUnconditional)
-					{
-						queueJumpTarget(newBlock, isn);
-						break;
-					}
-					if (cat == InstructionType::EffectiveNop || cat == InstructionType::FlagsOnly || cat == InstructionType::JumpConditional)
-					{
-						auto chainEnd = findJumpChainEnd(rva, isn, {});
-						if (chainEnd != 0)
-						{
-							queueJumpTargetRVA(newBlock, chainEnd, EdgeFlags::Unconditional | EdgeFlags::PatchedChain, rva);
-							jumpPatchRVAs.push_back(rva);
-							newBlock.end = rva + 1; // will be patched; keeping it as 1 ensures that next byte can be reused for some other jump chain
-							break;
-						}
-					}
-					if (cat == InstructionType::JumpConditional)
-					{
-						// re-decode instruction, since it was overwritten while exploring jump chains
-						queueJumpTargetRVA(newBlock, newBlock.end, EdgeFlags::Flow, rva);
-						queueJumpTarget(newBlock, src.disasm(rva));
-						break;
-					}
-
-					if (cat == InstructionType::CallDirect)
-					{
-						mRefs.push_back({ rva, mBinary.vaToRVA(isn->detail->x86.operands[0].imm), ReferenceType::Call });
-					}
-					if (cat == InstructionType::Halt)
-					{
-						hltRVAs.push_back(rva);
-					}
-
-					if (nextBlock != mBlocks.end() && newBlock.end == nextBlock->begin)
-					{
-						// we've reached a point where someone else jumped to, end the block now
-						newBlock.successors.push_back({ newBlock.end, EdgeFlags::Flow });
-						break;
-					}
-
-					rva = newBlock.end; // decode next instruction
-				}
-				// insert new block
-				if (newBlock.end > maxBlockEnd)
-					throw std::exception("Overlap between blocks");
-				mBlocks.insert(std::move(newBlock), nextBlock);
-			}
-			else if (existing->begin != rva)
-			{
-				// split existing block
-				auto isn = std::ranges::find(existing->instructions, rva);
-				if (isn == existing->instructions.end())
-					throw std::exception("Found jump mid instruction...");
-
-				Block pred{ existing->begin, rva };
-				pred.instructions.assign(existing->instructions.begin(), isn);
-				mBlocks.edit(existing).instructions.erase(existing->instructions.begin(), isn);
-				pred.successors.push_back({ rva, EdgeFlags::Flow });
-				mBlocks.shrink(rva, existing->end, existing);
-				mBlocks.insert(std::move(pred), nextBlock - 1);
-			}
-			// else: this block was already processed, nothing to do here...
+			break;
+		case X86_INS_JCXZ:
+		case X86_INS_JECXZ:
+		case X86_INS_JRCXZ:
+		case X86_INS_LOOP:
+		case X86_INS_LOOPE:
+		case X86_INS_LOOPNE:
+			throw std::exception("Unsupported instruction");
+			break;
 		}
-
-		if (!mSEHEntry)
-			mEndRVA = mBlocks.back().end;
-
-		// sort references
-		std::ranges::sort(mRefs, std::less(), [](const Reference& ref) { return ref.insnRVA; });
-
-		applyPatches(hltRVAs, jumpPatchRVAs);
+		return result;
 	}
 
-	const Block* findBlock(rva_t rva) const { return mBlocks.find(rva); }
-	const auto& refs() const { return mRefs; }
-
-	auto calls() const { return mRefs | std::ranges::views::filter([](const Reference& ref) { return ref.type == ReferenceType::Call; }); }
-	auto refsToSection(const PEBinary::Section& section) const { return mRefs | std::ranges::views::filter([&section](const Reference& ref) { return section.contains(ref.refRVA); }); }
-
-	void gatherCodeRefs(std::vector<rva_t>& refs, const PEBinary::Section& codeSection) const
+	void createEdgeToNewBlock(FunctionBlock& block, rva_t fromRVA, rva_t toRVA, EdgeFlags flags)
 	{
-		refs.append_range(refsToSection(codeSection) | std::ranges::views::transform([&](const Reference& ref) { return ref.refRVA; }));
+		//std::println("> scheduling [{:X}] {:X} -> {:X}", block.startRVA, fromRVA, toRVA);
+		ensure(toRVA >= mBegin && toRVA < mEnd);
+		mPendingBlockStarts.push_back(toRVA);
+		block.successors.push_back({ toRVA, flags });
 	}
 
-private:
+	void processJump(FunctionBlock& block)
+	{
+		ensure(!block.instructions.empty());
+		auto& isn = block.instructions.back();
+		ensure(isn.opcount == 1);
+		auto& op = isn.ops[0];
+		if (op.type == OperandType::ImmRVA)
+		{
+			auto target = static_cast<rva_t>(isn.imm);
+			// TODO: process tail recursion jumps...
+			ensure(target >= mBegin && target < mEnd);
+			//std::println("> scheduling [{:X}] {:X} -> {:X}", block.start, isn.rva, target);
+
+			auto flags = isn.mnem == X86_INS_JMP ? EdgeFlags::Unconditional : EdgeFlags::None;
+			if (isn.rva + 1 == block.end)
+				flags |= EdgeFlags::PatchedChain; // real jumps can't be 1-byte
+			block.successors.push_back({ target, flags });
+
+			mPendingBlockStarts.push_back(target);
+		}
+		else
+		{
+			// TODO: process switches...
+			__debugbreak();
+		}
+	}
+
 	// returns jump chain end RVA if passed instruction is the start of the jump chain, or 0 if not
 	rva_t findJumpChainEnd(rva_t rva, cs_insn* insn, FlagState flags, bool afterJump = false)
 	{
@@ -449,10 +539,6 @@ private:
 			return InstructionType::FlagsOnly;
 		case X86_INS_RET:
 			return InstructionType::Ret;
-		case X86_INS_CALL:
-			ensure(insn->detail->x86.op_count == 1);
-			ensure(insn->detail->x86.operands[0].type != X86_OP_MEM);
-			return insn->detail->x86.operands[0].type == X86_OP_IMM ? InstructionType::CallDirect : InstructionType::Normal;
 		case X86_INS_JMP:
 			ensure(insn->detail->x86.op_count == 1);
 			ensure(insn->detail->x86.operands[0].type == X86_OP_IMM);
@@ -488,25 +574,40 @@ private:
 		}
 	}
 
-	void applyPatches(const std::vector<rva_t>& hltRVAs, const std::vector<rva_t>& jumpPatchRVAs)
+	// fix up edges: replace RVAs with block indices
+	void fixupBlockEdges()
+	{
+		for (auto& block : mBlocks)
+		{
+			for (auto& succ : block.successors)
+			{
+				auto dest = ensure(mBlocks.find(succ.block));
+				succ.block = dest - &*mBlocks.begin();
+			}
+			std::ranges::sort(block.successors, std::less(), [](const auto& e) { return e.block; });
+		}
+	}
+
+	void applyPatches(bool sureAboutEnd)
 	{
 		// help ida - replace 'hlt' with 'icebp'
-		for (auto rva : hltRVAs)
+		for (auto rva : mHalts)
 		{
 			mBinary.bytes()[rva] = 0xF1;
 		}
 
 		// patch jumps
-		for (auto rva : jumpPatchRVAs)
+		for (auto rva : mJumpChains)
 		{
 			auto next = mBlocks.findNext(rva);
 			auto block = mBlocks.getPrevIfContains(next, rva);
-			ensure(block != mBlocks.end() && block->end == rva + 1 && !block->instructions.empty() && block->instructions.back() == rva && block->successors.size() == 1 && block->successors.front().flags == (EdgeFlags::Unconditional | EdgeFlags::PatchedChain));
-			auto target = block->successors.front().rva;
-			auto longJmp = target > rva + 129 || target < rva - 126;
-			auto actualEnd = block->end + (longJmp ? sizeof(int) : sizeof(char));
+			ensure(block != mBlocks.end() && block->end == rva + 1 && !block->instructions.empty() && block->successors.size() == 1 && block->successors.front().flags == (EdgeFlags::Unconditional | EdgeFlags::PatchedChain));
+			auto& jmpIsn = block->instructions.back();
+			ensure(jmpIsn.rva == rva && jmpIsn.mnem == X86_INS_JMP && jmpIsn.opcount == 1);
+			auto target = mBlocks[block->successors.front().block].begin;
+			auto actualEnd = block->end + jmpIsn.ops[0].size;
 			i32 jumpDelta = target - actualEnd;
-			if (longJmp)
+			if (jmpIsn.ops[0].size > 1)
 			{
 				mBinary.bytes()[rva] = 0xE9;
 				*(i32*)(mBinary.bytes().data() + block->end) = jumpDelta;
@@ -520,7 +621,7 @@ private:
 		}
 
 		// patch space between blocks with nops
-		auto junkStart = mStartRVA;
+		auto junkStart = mBegin;
 		auto junkify = [&](rva_t goodRVA) {
 			ensure(goodRVA >= junkStart);
 			memset(mBinary.bytes().data() + junkStart, 0x90, goodRVA - junkStart);
@@ -530,16 +631,113 @@ private:
 			junkify(block.begin);
 			junkStart = block.end;
 		}
-		junkify(mEndRVA);
+		if (sureAboutEnd)
+			junkify(mEnd);
 	}
 
 private:
 	PEBinary& mBinary;
+	rva_t mBegin;
+	rva_t mEnd;
+	RangeMap<FunctionBlock> mBlocks;
+	std::vector<rva_t> mPendingBlockStarts; // blocks to be analyzed
+	std::vector<rva_t> mHalts;
+	std::vector<rva_t> mJumpChains;
+};
+
+export class FunctionInfo
+{
+public:
+	enum class ReferenceType
+	{
+		Unknown,
+		Address, // lea
+		Read, // operand 1+
+		Write, // operand 0 (can be read-write)
+		Call, // normal call or tail-recursion jmp
+	};
+
+	// a RIP-relative reference to some external executable item (function, piece of data, etc)
+	struct Reference
+	{
+		rva_t insnRVA;
+		rva_t refRVA;
+		ReferenceType type;
+	};
+
+	FunctionInfo(PEBinary& src, rva_t funcStartRVA, std::string_view name)
+		: mName(name)
+		, mSEHEntry(src.findSEHEntry(funcStartRVA))
+		, mStartRVA(funcStartRVA)
+		, mEndRVA(mSEHEntry ? mSEHEntry->end : src.bytes().size())
+	{
+		if (name.length() > 0)
+			std::println("Processing function {} at {}", name, src.formatRVA(funcStartRVA));
+
+		if (mSEHEntry && mSEHEntry->begin != funcStartRVA)
+			throw std::exception("RVA is mid function");
+
+		mBlocks = FunctionBlockAnalysis(src, mStartRVA, mEndRVA, mSEHEntry != nullptr).result();
+		if (!mSEHEntry)
+			mEndRVA = mBlocks.back().end;
+
+		// note: below is optional stuff, maybe it should be done on demand?..
+		buildPredecessorEdges();
+
+		// gather refs (TODO: proper constant propagation analysis...)
+		for (auto& block : mBlocks)
+		{
+			for (int iIsn = 0; iIsn < block.instructions.size(); ++iIsn)
+			{
+				auto& isn = block.instructions[iIsn];
+				for (int iOp = 0; iOp < isn.opcount; ++iOp)
+				{
+					auto& op = isn.ops[iOp];
+					if (op.type == OperandType::MemRVA)
+					{
+						ensure(op.access == (iOp == 0 ? CS_AC_WRITE : CS_AC_READ)); // ???
+						auto type = iOp == 0 ? ReferenceType::Write : isn.mnem == X86_INS_LEA ? ReferenceType::Address : ReferenceType::Read;
+						mRefs.push_back({ isn.rva, static_cast<rva_t>(isn.mem.disp), type });
+					}
+				}
+
+				if (isn.mnem == X86_INS_CALL && isn.ops[0].type == OperandType::ImmRVA)
+				{
+					mRefs.push_back({ isn.rva, static_cast<rva_t>(isn.imm), ReferenceType::Call });
+				}
+			}
+		}
+	}
+
+	const FunctionBlock* findBlock(rva_t rva) const { return mBlocks.find(rva); }
+	const auto& refs() const { return mRefs; }
+
+	auto calls() const { return mRefs | std::ranges::views::filter([](const Reference& ref) { return ref.type == ReferenceType::Call; }); }
+	auto refsToSection(const PEBinary::Section& section) const { return mRefs | std::ranges::views::filter([&section](const Reference& ref) { return section.contains(ref.refRVA); }); }
+
+	void gatherCodeRefs(std::vector<rva_t>& refs, const PEBinary::Section& codeSection) const
+	{
+		refs.append_range(refsToSection(codeSection) | std::ranges::views::transform([&](const Reference& ref) { return ref.refRVA; }));
+	}
+
+private:
+	void buildPredecessorEdges()
+	{
+		for (int i = 0; i < mBlocks.size(); ++i)
+		{
+			for (auto& succ : mBlocks[i].successors)
+			{
+				mBlocks[succ.block].predecessors.push_back({ i, succ.flags });
+			}
+		}
+	}
+
+private:
 	std::string mName;
 	const SEHInfo::Entry* mSEHEntry = nullptr;
 	rva_t mStartRVA = 0;
 	rva_t mEndRVA = 0;
-	RangeMap<Block> mBlocks;
+	RangeMap<FunctionBlock> mBlocks;
 	std::vector<Reference> mRefs; // rip-relative references, sorted by instruction RVAs
 };
 
