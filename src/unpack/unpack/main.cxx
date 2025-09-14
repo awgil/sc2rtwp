@@ -5,6 +5,7 @@ import std;
 import common;
 import unpack.pe_binary;
 import unpack.function;
+import unpack.analysis;
 import unpack.known_structs;
 
 template<typename T, typename F> constexpr size_t fieldOffset(F (T::*f))
@@ -159,6 +160,8 @@ private:
 	void processBootstrapStart()
 	{
 		auto& start = mFuncs.process(mBinary.entryPoint(), "bootstrapStart");
+		auto ana = AnalyzedFunction{ start };
+
 		matchDataFieldRefs(start, &BootstrapStartState::stage);
 		matchTextReferences(start);
 		ensure(mBSS.address() - mSectionData.begin == 0x60); // not sure what's there before it and how likely is it to change...

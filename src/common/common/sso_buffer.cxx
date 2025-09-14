@@ -46,6 +46,7 @@ public:
 
 		T* newData = newInEmbedded ? embeddedStorage() : allocator_type().allocate(capacity);
 		func(data(), newData);
+		resetExternal();
 		setFields(capacity, newData);
 	}
 
@@ -61,6 +62,7 @@ public:
 			return false;
 		}
 
+		resetExternal();
 		setFields(victimCapacity, victim.mExternal);
 		victim.setFields(RhsFixedSize, victim.embeddedStorage());
 		return true;
@@ -84,7 +86,6 @@ private:
 
 	void setFields(size_t capacity, T* data)
 	{
-		resetExternal();
 		if (capacity <= FixedSize)
 		{
 			assert(data == embeddedStorage());

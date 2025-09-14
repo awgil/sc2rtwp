@@ -60,6 +60,11 @@ public:
 		return it != end() ? &*it : nullptr;
 	}
 
+	int findIndex(const Key& key) const
+	{
+		return getPrevIfContains(findNext(key), key) - begin();
+	}
+
 	// insert new entry; ensures it does not overlap with anything else
 	// if hint is provided, it should point to the next entry
 	void insert(Entry&& e, auto hint)

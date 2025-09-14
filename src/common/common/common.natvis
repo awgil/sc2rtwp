@@ -65,6 +65,8 @@
         <DisplayString Condition="ops[0].type == OperandType::MemRVA">{mem,view(rva)}</DisplayString>
         <Expand>
           <ExpandedItem>ops[0]</ExpandedItem>
+          <Item Name="imm" Condition="ops[0].type == OperandType::Imm || ops[0].type == OperandType::ImmRVA">imm</Item>
+          <ExpandedItem Condition="ops[0].type == OperandType::Mem || ops[0].type == OperandType::MemRVA">mem</ExpandedItem>
         </Expand>
       </Synthetic>
       <Synthetic Name="op1" Condition="opcount &gt; 1">
@@ -75,6 +77,8 @@
         <DisplayString Condition="ops[1].type == OperandType::MemRVA">{mem,view(rva)}</DisplayString>
         <Expand>
           <ExpandedItem>ops[1]</ExpandedItem>
+          <Item Name="imm" Condition="ops[1].type == OperandType::Imm || ops[1].type == OperandType::ImmRVA">imm</Item>
+          <ExpandedItem Condition="ops[1].type == OperandType::Mem || ops[1].type == OperandType::MemRVA">mem</ExpandedItem>
         </Expand>
       </Synthetic>
       <Synthetic Name="op2" Condition="opcount &gt; 2">
@@ -85,6 +89,8 @@
         <DisplayString Condition="ops[2].type == OperandType::MemRVA">{mem,view(rva)}</DisplayString>
         <Expand>
           <ExpandedItem>ops[2]</ExpandedItem>
+          <Item Name="imm" Condition="ops[2].type == OperandType::Imm || ops[2].type == OperandType::ImmRVA">imm</Item>
+          <ExpandedItem Condition="ops[2].type == OperandType::Mem || ops[2].type == OperandType::MemRVA">mem</ExpandedItem>
         </Expand>
       </Synthetic>
       <Synthetic Name="op3" Condition="opcount &gt; 3">
@@ -95,6 +101,8 @@
         <DisplayString Condition="ops[3].type == OperandType::MemRVA">{mem,view(rva)}</DisplayString>
         <Expand>
           <ExpandedItem>ops[3]</ExpandedItem>
+          <Item Name="imm" Condition="ops[3].type == OperandType::Imm || ops[3].type == OperandType::ImmRVA">imm</Item>
+          <ExpandedItem Condition="ops[3].type == OperandType::Mem || ops[3].type == OperandType::MemRVA">mem</ExpandedItem>
         </Expand>
       </Synthetic>
     </Expand>

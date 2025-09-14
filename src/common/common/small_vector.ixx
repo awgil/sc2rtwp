@@ -55,6 +55,12 @@ public:
 		insert(begin(), first, last);
 	}
 
+	template<std::ranges::range R>
+	SmallVector(R&& range)
+	{
+		insert(begin(), range.begin(), range.end());
+	}
+
 	// Create/assign from initializer list.
 	SmallVector(std::initializer_list<T> init) { insert(begin(), init.begin(), init.end()); }
 

@@ -95,14 +95,13 @@ private:
 	Conditional mValue = Conditional::None; // invariant: mValue & ~mKnown == 0 (ie all unknown bits are zero)
 };
 
-export enum EdgeFlags : u8
+export enum class EdgeFlags : u8
 {
 	None,
 	Unconditional = 1 << 0, // the only edge in a block
 	PatchedChain = 1 << 1, // this is a jump that was represented by a chain in original code
 	Flow = 1 << 2, // immediately following instruction
-	Loop = 1 << 3, // jump to next iteration of a loop (TODO: remove maybe and replace with topological order...)
-	Indirect = 1 << 4, // part of switch statement
+	Indirect = 1 << 3, // part of switch statement
 };
 ADD_BITFIELD_OPS(EdgeFlags);
 
@@ -142,15 +141,14 @@ export struct Instruction
 // edge between two blocks
 export struct FunctionEdge
 {
-	int block; // index of the block; note that while blocks are being built, this stores RVA instead!
+	rva_t rva;
 	EdgeFlags flags;
 };
 
 export struct FunctionBlock : RangeMapEntry<rva_t>
 {
 	std::vector<Instruction> instructions;
-	SmallVector<FunctionEdge, 2> successors; // can be empty (if block ends with return / tail recursion jump), contain 1 entry (unconditional jump), 2 entries (conditional jump + implicit flow) or multiple entries (switch); sorted
-	SmallVector<FunctionEdge, 2> predecessors; // note: optionally filled in...
+	SmallVector<FunctionEdge, 2> successors; // can be empty (if block ends with return / tail recursion jump), contain 1 entry (unconditional jump), 2 entries (conditional jump + implicit flow) or multiple entries (switch)
 
 	auto findInstruction(rva_t rva) const { return std::ranges::find_if(instructions, [rva](const auto& isn) { return isn.rva == rva; }); }
 };
@@ -182,7 +180,6 @@ public:
 			mPendingBlockStarts.pop_back();
 			analyzeBlock(rva);
 		}
-		fixupBlockEdges();
 		applyPatches(sureAboutEnd);
 	}
 
@@ -574,20 +571,6 @@ private:
 		}
 	}
 
-	// fix up edges: replace RVAs with block indices
-	void fixupBlockEdges()
-	{
-		for (auto& block : mBlocks)
-		{
-			for (auto& succ : block.successors)
-			{
-				auto dest = ensure(mBlocks.find(succ.block));
-				succ.block = dest - &*mBlocks.begin();
-			}
-			std::ranges::sort(block.successors, std::less(), [](const auto& e) { return e.block; });
-		}
-	}
-
 	void applyPatches(bool sureAboutEnd)
 	{
 		// help ida - replace 'hlt' with 'icebp'
@@ -604,7 +587,7 @@ private:
 			ensure(block != mBlocks.end() && block->end == rva + 1 && !block->instructions.empty() && block->successors.size() == 1 && block->successors.front().flags == (EdgeFlags::Unconditional | EdgeFlags::PatchedChain));
 			auto& jmpIsn = block->instructions.back();
 			ensure(jmpIsn.rva == rva && jmpIsn.mnem == X86_INS_JMP && jmpIsn.opcount == 1);
-			auto target = mBlocks[block->successors.front().block].begin;
+			auto target = block->successors.front().rva;
 			auto actualEnd = block->end + jmpIsn.ops[0].size;
 			i32 jumpDelta = target - actualEnd;
 			if (jmpIsn.ops[0].size > 1)
@@ -682,8 +665,6 @@ public:
 			mEndRVA = mBlocks.back().end;
 
 		// note: below is optional stuff, maybe it should be done on demand?..
-		buildPredecessorEdges();
-
 		// gather refs (TODO: proper constant propagation analysis...)
 		for (auto& block : mBlocks)
 		{
@@ -709,6 +690,7 @@ public:
 		}
 	}
 
+	const auto& blocks() const { return mBlocks; }
 	const FunctionBlock* findBlock(rva_t rva) const { return mBlocks.find(rva); }
 	const auto& refs() const { return mRefs; }
 
@@ -718,18 +700,6 @@ public:
 	void gatherCodeRefs(std::vector<rva_t>& refs, const PEBinary::Section& codeSection) const
 	{
 		refs.append_range(refsToSection(codeSection) | std::ranges::views::transform([&](const Reference& ref) { return ref.refRVA; }));
-	}
-
-private:
-	void buildPredecessorEdges()
-	{
-		for (int i = 0; i < mBlocks.size(); ++i)
-		{
-			for (auto& succ : mBlocks[i].successors)
-			{
-				mBlocks[succ.block].predecessors.push_back({ i, succ.flags });
-			}
-		}
 	}
 
 private:
