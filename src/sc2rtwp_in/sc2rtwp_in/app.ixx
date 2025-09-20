@@ -76,21 +76,21 @@ private:
 	{
 		switch (vk)
 		{
-		case VK_SHIFT:
-		case VK_LSHIFT:
-		case VK_RSHIFT:
-			changeModifierState(Modifier::Shift, down);
-			break;
-		case VK_CONTROL:
-		case VK_LCONTROL:
-		case VK_RCONTROL:
-			changeModifierState(Modifier::Ctrl, down);
-			break;
-		case VK_MENU:
-		case VK_LMENU:
-		case VK_RMENU:
-			changeModifierState(Modifier::Alt, down);
-			break;
+		//case VK_SHIFT:
+		//case VK_LSHIFT:
+		//case VK_RSHIFT:
+		//	changeModifierState(Modifier::Shift, down);
+		//	break;
+		//case VK_CONTROL:
+		//case VK_LCONTROL:
+		//case VK_RCONTROL:
+		//	changeModifierState(Modifier::Ctrl, down);
+		//	break;
+		//case VK_MENU:
+		//case VK_LMENU:
+		//case VK_RMENU:
+		//	changeModifierState(Modifier::Alt, down);
+		//	break;
 		default:
 			if (auto it = mKeybinds.find(Keybind{ vk, mHeldModifiers, down }); it != mKeybinds.end())
 				it->second();

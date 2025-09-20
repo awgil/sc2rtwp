@@ -108,4 +108,38 @@
     </Expand>
   </Type>
 
+  <Type Name="AnalysisPointer">
+    <DisplayString Condition="addressSpace &lt; AnalysisVariables::AS_Count &amp;&amp; offset &lt; 0">[{(AnalysisVariables::StandardAddressSpaces)addressSpace,en} - {-offset,x}]</DisplayString>
+    <DisplayString Condition="addressSpace &lt; AnalysisVariables::AS_Count">[{(AnalysisVariables::StandardAddressSpaces)addressSpace,en} + {offset,x}]</DisplayString>
+    <DisplayString Condition="offset &lt; 0">[AS_{addressSpace,d} - {-offset,x}]</DisplayString>
+    <DisplayString>[AS_{addressSpace,d} + {-offset,x}]</DisplayString>
+  </Type>
+
+  <Type Name="AnalysisVariableRef">
+    <DisplayString Condition="index &lt; AnalysisVariables::V_Count">({(AnalysisVariables::StandardVariables)index,en}.{version,d})</DisplayString>
+    <DisplayString>(V_{index,d}.{version,d})</DisplayString>
+  </Type>
+
+  <Type Name="AnalysisValueWithType">
+    <DisplayString Condition="type == AnalysisValueType::Unknown">Unk</DisplayString>
+    <DisplayString Condition="type == AnalysisValueType::Constant">Const {value.constant}</DisplayString>
+    <DisplayString Condition="type == AnalysisValueType::Pointer">Ptr {value.ptr}</DisplayString>
+    <DisplayString Condition="type == AnalysisValueType::Deref">Var {value.var}</DisplayString>
+  </Type>
+
+  <Type Name="AnalysisVariableValue">
+    <Expand>
+      <Item Name="[rva]">assignment,x</Item>
+      <Item Name="[op]">op,en</Item>
+      <Item Name="[lhs]" Condition="operandType[0] == AnalysisValueType::Constant">operandValue[0].constant</Item>
+      <Item Name="[lhs]" Condition="operandType[0] == AnalysisValueType::Pointer">operandValue[0].ptr</Item>
+      <Item Name="[lhs]" Condition="operandType[0] == AnalysisValueType::Deref">operandValue[0].var</Item>
+      <Item Name="[rhs]" Condition="op != AnalysisValueOp::Assign &amp;&amp; operandType[0] == AnalysisValueType::Constant">operandValue[1].constant</Item>
+      <Item Name="[rhs]" Condition="op != AnalysisValueOp::Assign &amp;&amp; operandType[0] == AnalysisValueType::Pointer">operandValue[1].ptr</Item>
+      <Item Name="[rhs]" Condition="op != AnalysisValueOp::Assign &amp;&amp; operandType[0] == AnalysisValueType::Deref">operandValue[1].var</Item>
+      <Item Name="[block]">blockIndex,d</Item>
+      <Item Name="[refs]">numRefs,d</Item>
+    </Expand>
+  </Type>
+
 </AutoVisualizer>
