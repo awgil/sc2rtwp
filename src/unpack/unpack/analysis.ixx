@@ -12,11 +12,13 @@ import common;
 import unpack.pe_binary;
 import unpack.function;
 
-// an uninterrupted sequence of instructions (potentially split into several disjoint ranges, with unconditional jumps between them)
-// each basic block has only one entry point
-export struct BasicBlock
+// an uninterrupted sequence of instructions; each basic block has only one entry point
+// topologically sorted (aka reverse post-order), so:
+// - all non-loop predecessors are ordered before a given block
+// - two disjoint instruction ranges that can conceptually be combined into a single basic block have successive indices
+export struct AnalysisBlock
 {
-	SmallVector<const FunctionBlock*, 1> fblocks; // in exec order
+	const FunctionBlock* fblock;
 	SmallVector<int, 2> successors;
 	SmallVector<int, 2> predecessors;
 	SmallVector<int, 2> dominanceFrontier;
@@ -28,18 +30,21 @@ struct AnalysisPointer
 	int addressSpace;
 	int offset;
 };
+AnalysisPointer operator+(AnalysisPointer l, i32 r) { return{ l.addressSpace, l.offset + r }; }
+AnalysisPointer& operator+=(AnalysisPointer& l, i32 r) { l.offset += r; return l; }
+AnalysisPointer operator-(AnalysisPointer l, i32 r) { return{ l.addressSpace, l.offset - r }; }
+AnalysisPointer& operator-=(AnalysisPointer& l, i32 r) { l.offset -= r; return l; }
 
-struct AnalysisVariableRef
+struct AnalysisExpressionRef
 {
-	int index;
-	int version;
+	size_t index;
 };
 
 union AnalysisValue
 {
 	i64 constant;
 	AnalysisPointer ptr;
-	AnalysisVariableRef var;
+	AnalysisExpressionRef expr;
 };
 
 enum class AnalysisValueType : u8
@@ -47,7 +52,7 @@ enum class AnalysisValueType : u8
 	Unknown,
 	Constant,
 	Pointer,
-	Deref,
+	Expression,
 };
 
 struct AnalysisValueWithType
@@ -58,78 +63,77 @@ struct AnalysisValueWithType
 	AnalysisValueWithType() : type(AnalysisValueType::Unknown), value(0) {}
 	AnalysisValueWithType(i64 value) : type(AnalysisValueType::Constant), value(value) {}
 	AnalysisValueWithType(AnalysisPointer value) : type(AnalysisValueType::Pointer), value{ .ptr = value } {}
-	AnalysisValueWithType(AnalysisVariableRef value) : type(AnalysisValueType::Deref), value{ .var = value } {}
+	AnalysisValueWithType(AnalysisExpressionRef value) : type(AnalysisValueType::Expression), value{ .expr = value } {}
 	AnalysisValueWithType(AnalysisValueType type, AnalysisValue value) : type(type), value(value) {}
 };
 
-enum class AnalysisValueOp : u8
+enum class AnalysisExpressionOp : u8
 {
-	Assign, // = op1
+	Invalid,
+
+	// unary expressions
+	Neg, // = -op1
+	Not, // = ~op1
+	LastUnary,
+
+	// binary expressions
+	Deref, // = *(op1 + op2) (op1 is base address, op2 is an offset - constant or variable)
 	Add, // = op1 + op2
-	Sub, // = op1 - op2
 	Xor, // = op1 ^ op2
+	LastBinary,
 };
 
-struct AnalysisVariableValue
+// note: for commutative binary ops, if one of the operands is constant, it's always second one
+struct AnalysisExpression
 {
-	rva_t assignment = 0;
+	rva_t rva = 0;
 	int blockIndex = 0;
-	int numRefs = 0; // if 0, this is a dead variable
-	AnalysisValueOp op;
-	// TODO: op size
-	AnalysisValueType operandType[2];
-	AnalysisValue operandValue[2];
+	int size = 0; // byte width of the result (TODO: do we care here?..)
+	AnalysisExpressionOp op = AnalysisExpressionOp::Invalid;
+	AnalysisValueType operandType[2] = {};
+	AnalysisValue operandValue[2] = {};
 
-	AnalysisVariableValue(AnalysisValueOp op, AnalysisValueType type1, AnalysisValue value1, AnalysisValueType type2, AnalysisValue value2)
-		: op(op)
+	AnalysisExpression() = default;
+
+	// binary op
+	AnalysisExpression(int size, AnalysisValueWithType lhs, AnalysisExpressionOp op, AnalysisValueWithType rhs)
+		: size(size), op(op)
 	{
-		setOperand(0, type1, value1);
-		setOperand(1, type2, value2);
+		setOperand(0, lhs);
+		setOperand(1, rhs);
 	}
 
-	AnalysisVariableValue(AnalysisValueType type, AnalysisValue value)
-		: op(AnalysisValueOp::Assign)
+	// unary op
+	AnalysisExpression(int size, AnalysisExpressionOp op, AnalysisValueWithType value) : AnalysisExpression(size, value, op, {}) {}
+	//AnalysisExpression(i64 value) : AnalysisVariableValue(AnalysisValueType::Constant, { .constant = value }) {}
+	//AnalysisExpression(AnalysisPointer value) : AnalysisVariableValue(AnalysisValueType::Pointer, { .ptr = value }) {}
+	//AnalysisExpression(AnalysisVariableRef value) : AnalysisVariableValue(AnalysisValueType::Deref, { .var = value }) {}
+	//AnalysisExpression(AnalysisValueWithType val) : AnalysisVariableValue(val.type, val.value) {}
+
+	AnalysisValueWithType getOperand(int index) const { return{ operandType[index], operandValue[index] }; }
+	void setOperand(int index, AnalysisValueWithType value)
 	{
-		setOperand(0, type, value);
-		setUnknown(1);
+		operandType[index] = value.type;
+		operandValue[index] = value.value;
 	}
 
-	AnalysisVariableValue() : AnalysisVariableValue(AnalysisValueType::Unknown, { .constant = 0 }) {}
-	AnalysisVariableValue(i64 value) : AnalysisVariableValue(AnalysisValueType::Constant, { .constant = value }) {}
-	AnalysisVariableValue(AnalysisPointer value) : AnalysisVariableValue(AnalysisValueType::Pointer, { .ptr = value }) {}
-	AnalysisVariableValue(AnalysisVariableRef value) : AnalysisVariableValue(AnalysisValueType::Deref, { .var = value }) {}
-	AnalysisVariableValue(AnalysisValueWithType val) : AnalysisVariableValue(val.type, val.value) {}
-
-	void setOperand(int index, AnalysisValueType type, AnalysisValue value)
-	{
-		operandType[index] = type;
-		operandValue[index] = value;
-	}
-
-	void setUnknown(int index) { setOperand(index, AnalysisValueType::Unknown, { .constant = 0 }); }
-	void setConstant(int index, i64 value) { setOperand(index, AnalysisValueType::Constant, { .constant = value }); }
-	void setPointer(int index, AnalysisPointer value) { setOperand(index, AnalysisValueType::Pointer, { .ptr = value }); }
-	void setPointer(int index, int addressSpace, int offset) { setPointer(index, { addressSpace, offset }); }
-	void setVariable(int index, AnalysisVariableRef value) { setOperand(index, AnalysisValueType::Deref, { .var = value }); }
-	void setVariable(int index, int var, int version) { setVariable(index, { var, version }); }
-
-	bool isUnknown() const { return op == AnalysisValueOp::Assign && operandType[0] == AnalysisValueType::Unknown; }
-
-	AnalysisValueWithType getOperand(int index) { return{ operandType[index], operandValue[index] }; }
+	//void setUnknown(int index) { setOperand(index, AnalysisValueType::Unknown, { .constant = 0 }); }
+	//void setConstant(int index, i64 value) { setOperand(index, AnalysisValueType::Constant, { .constant = value }); }
+	//void setPointer(int index, AnalysisPointer value) { setOperand(index, AnalysisValueType::Pointer, { .ptr = value }); }
+	//void setPointer(int index, int addressSpace, int offset) { setPointer(index, { addressSpace, offset }); }
+	//void setExpression(int index, AnalysisExpressionRef value) { setOperand(index, AnalysisValueType::Expression, { .expr = value }); }
+	//void setExpression(int index, size_t var) { setExpression(index, AnalysisExpressionRef{ var }); }
 };
 
-struct AnalysisVariableHistory
+// known memory state
+struct AnalysisState
 {
-	SmallVector<AnalysisVariableValue, 1> entries;
+	std::vector<SimpleRangeMap<int, AnalysisValueWithType>> addressSpaces; // for each address space: key = offset, value = variable state
 
-	AnalysisVariableHistory() { entries.emplace_back(); }
-};
-
-struct AnalysisVariables
-{
 	enum StandardAddressSpaces
 	{
 		AS_Unknown,
+		AS_Register, // offset depends on register id
 		AS_Global, // offset = rva
 		AS_Stack, // offset 0 is retaddr
 		AS_Thread, // gs:[offset]
@@ -137,49 +141,203 @@ struct AnalysisVariables
 		AS_Count
 	};
 
-	enum StandardVariables
+	static AnalysisState buildEntryState()
 	{
-		V_rax,
-		V_rcx,
-		V_rdx,
-		V_rbx,
-		V_rsp,
-		V_rbp,
-		V_rsi,
-		V_rdi,
-		V_r8,
-		V_r9,
-		V_r10,
-		V_r11,
-		V_r12,
-		V_r13,
-		V_r14,
-		V_r15,
-		V_xmm0,
-		V_xmm1,
-		V_xmm2,
-		V_xmm3,
-		V_xmm4,
-		V_xmm5,
-		V_xmm6,
-		V_xmm7,
-		V_xmm8,
-		V_xmm9,
-		V_xmm10,
-		V_xmm11,
-		V_xmm12,
-		V_xmm13,
-		V_xmm14,
-		V_xmm15,
+		AnalysisState res;
+		res.addressSpaces.resize(AS_Count);
+		auto [rspStart, rspEnd] = registerToRange(X86_REG_RSP);
+		res.addressSpaces[AS_Register].insert({ rspStart, rspEnd, AnalysisPointer{ AS_Stack }});
+		return res;
+	}
 
-		V_Count
-	};
+	static std::pair<int, int> registerToOffsetSize(x86_reg reg)
+	{
+		static constexpr int gprStart = 0;
+		static constexpr int gprSize = 8;
+		static auto gprOffset = [](int index) { return gprStart + index * gprSize; };
+		static auto gprPair = [](int index, int size, int offset = 0) { return std::make_pair(gprOffset(index) + offset, size); };
+		static constexpr int xmmStart = gprOffset(16);
+		static constexpr int xmmSize = 64;
+		static auto xmmOffset = [](int index) { return xmmStart + index * xmmSize; };
+		static auto xmmPair = [](int index, int size) { return std::make_pair(xmmOffset(index), size); };
+		// unsupported: flags, ip, segment regs, cr, dr, fpu, mmx, k (avx), bnd
+		switch (reg)
+		{
+		case X86_REG_AL: return gprPair(0, 1);
+		case X86_REG_AH: return gprPair(0, 1, 1);
+		case X86_REG_AX: return gprPair(0, 2);
+		case X86_REG_EAX: return gprPair(0, 4);
+		case X86_REG_RAX: return gprPair(0, 8);
+		case X86_REG_CL: return gprPair(1, 1);
+		case X86_REG_CH: return gprPair(1, 1, 1);
+		case X86_REG_CX: return gprPair(1, 2);
+		case X86_REG_ECX: return gprPair(1, 4);
+		case X86_REG_RCX: return gprPair(1, 8);
+		case X86_REG_DL: return gprPair(2, 1);
+		case X86_REG_DH: return gprPair(2, 1, 1);
+		case X86_REG_DX: return gprPair(2, 2);
+		case X86_REG_EDX: return gprPair(2, 4);
+		case X86_REG_RDX: return gprPair(2, 8);
+		case X86_REG_BL: return gprPair(3, 1);
+		case X86_REG_BH: return gprPair(3, 1, 1);
+		case X86_REG_BX: return gprPair(3, 2);
+		case X86_REG_EBX: return gprPair(3, 4);
+		case X86_REG_RBX: return gprPair(3, 8);
+		case X86_REG_SPL: return gprPair(4, 1);
+		case X86_REG_SP: return gprPair(4, 2);
+		case X86_REG_ESP: return gprPair(4, 4);
+		case X86_REG_RSP: return gprPair(4, 8);
+		case X86_REG_BPL: return gprPair(5, 1);
+		case X86_REG_BP: return gprPair(5, 2);
+		case X86_REG_EBP: return gprPair(5, 4);
+		case X86_REG_RBP: return gprPair(5, 8);
+		case X86_REG_SIL: return gprPair(6, 1);
+		case X86_REG_SI: return gprPair(6, 2);
+		case X86_REG_ESI: return gprPair(6, 4);
+		case X86_REG_RSI: return gprPair(6, 8);
+		case X86_REG_DIL: return gprPair(7, 1);
+		case X86_REG_DI: return gprPair(7, 2);
+		case X86_REG_EDI: return gprPair(7, 4);
+		case X86_REG_RDI: return gprPair(7, 8);
+		case X86_REG_R8B: return gprPair(8, 1);
+		case X86_REG_R8W: return gprPair(8, 2);
+		case X86_REG_R8D: return gprPair(8, 4);
+		case X86_REG_R8: return gprPair(8, 8);
+		case X86_REG_R9B: return gprPair(9, 1);
+		case X86_REG_R9W: return gprPair(9, 2);
+		case X86_REG_R9D: return gprPair(9, 4);
+		case X86_REG_R9: return gprPair(9, 8);
+		case X86_REG_R10B: return gprPair(10, 1);
+		case X86_REG_R10W: return gprPair(10, 2);
+		case X86_REG_R10D: return gprPair(10, 4);
+		case X86_REG_R10: return gprPair(10, 8);
+		case X86_REG_R11B: return gprPair(11, 1);
+		case X86_REG_R11W: return gprPair(11, 2);
+		case X86_REG_R11D: return gprPair(11, 4);
+		case X86_REG_R11: return gprPair(11, 8);
+		case X86_REG_R12B: return gprPair(12, 1);
+		case X86_REG_R12W: return gprPair(12, 2);
+		case X86_REG_R12D: return gprPair(12, 4);
+		case X86_REG_R12: return gprPair(12, 8);
+		case X86_REG_R13B: return gprPair(13, 1);
+		case X86_REG_R13W: return gprPair(13, 2);
+		case X86_REG_R13D: return gprPair(13, 4);
+		case X86_REG_R13: return gprPair(13, 8);
+		case X86_REG_R14B: return gprPair(14, 1);
+		case X86_REG_R14W: return gprPair(14, 2);
+		case X86_REG_R14D: return gprPair(14, 4);
+		case X86_REG_R14: return gprPair(14, 8);
+		case X86_REG_R15B: return gprPair(15, 1);
+		case X86_REG_R15W: return gprPair(15, 2);
+		case X86_REG_R15D: return gprPair(15, 4);
+		case X86_REG_R15: return gprPair(15, 8);
+		case X86_REG_XMM0: return xmmPair(0, 16);
+		case X86_REG_YMM0: return xmmPair(0, 32);
+		case X86_REG_ZMM0: return xmmPair(0, 64);
+		case X86_REG_XMM1: return xmmPair(1, 16);
+		case X86_REG_YMM1: return xmmPair(1, 32);
+		case X86_REG_ZMM1: return xmmPair(1, 64);
+		case X86_REG_XMM2: return xmmPair(2, 16);
+		case X86_REG_YMM2: return xmmPair(2, 32);
+		case X86_REG_ZMM2: return xmmPair(2, 64);
+		case X86_REG_XMM3: return xmmPair(3, 16);
+		case X86_REG_YMM3: return xmmPair(3, 32);
+		case X86_REG_ZMM3: return xmmPair(3, 64);
+		case X86_REG_XMM4: return xmmPair(4, 16);
+		case X86_REG_YMM4: return xmmPair(4, 32);
+		case X86_REG_ZMM4: return xmmPair(4, 64);
+		case X86_REG_XMM5: return xmmPair(5, 16);
+		case X86_REG_YMM5: return xmmPair(5, 32);
+		case X86_REG_ZMM5: return xmmPair(5, 64);
+		case X86_REG_XMM6: return xmmPair(6, 16);
+		case X86_REG_YMM6: return xmmPair(6, 32);
+		case X86_REG_ZMM6: return xmmPair(6, 64);
+		case X86_REG_XMM7: return xmmPair(7, 16);
+		case X86_REG_YMM7: return xmmPair(7, 32);
+		case X86_REG_ZMM7: return xmmPair(7, 64);
+		case X86_REG_XMM8: return xmmPair(8, 16);
+		case X86_REG_YMM8: return xmmPair(8, 32);
+		case X86_REG_ZMM8: return xmmPair(8, 64);
+		case X86_REG_XMM9: return xmmPair(9, 16);
+		case X86_REG_YMM9: return xmmPair(9, 32);
+		case X86_REG_ZMM9: return xmmPair(9, 64);
+		case X86_REG_XMM10: return xmmPair(10, 16);
+		case X86_REG_YMM10: return xmmPair(10, 32);
+		case X86_REG_ZMM10: return xmmPair(10, 64);
+		case X86_REG_XMM11: return xmmPair(11, 16);
+		case X86_REG_YMM11: return xmmPair(11, 32);
+		case X86_REG_ZMM11: return xmmPair(11, 64);
+		case X86_REG_XMM12: return xmmPair(12, 16);
+		case X86_REG_YMM12: return xmmPair(12, 32);
+		case X86_REG_ZMM12: return xmmPair(12, 64);
+		case X86_REG_XMM13: return xmmPair(13, 16);
+		case X86_REG_YMM13: return xmmPair(13, 32);
+		case X86_REG_ZMM13: return xmmPair(13, 64);
+		case X86_REG_XMM14: return xmmPair(14, 16);
+		case X86_REG_YMM14: return xmmPair(14, 32);
+		case X86_REG_ZMM14: return xmmPair(14, 64);
+		case X86_REG_XMM15: return xmmPair(15, 16);
+		case X86_REG_YMM15: return xmmPair(15, 32);
+		case X86_REG_ZMM15: return xmmPair(15, 64);
+		case X86_REG_XMM16: return xmmPair(16, 16);
+		case X86_REG_YMM16: return xmmPair(16, 32);
+		case X86_REG_ZMM16: return xmmPair(16, 64);
+		case X86_REG_XMM17: return xmmPair(17, 16);
+		case X86_REG_YMM17: return xmmPair(17, 32);
+		case X86_REG_ZMM17: return xmmPair(17, 64);
+		case X86_REG_XMM18: return xmmPair(18, 16);
+		case X86_REG_YMM18: return xmmPair(18, 32);
+		case X86_REG_ZMM18: return xmmPair(18, 64);
+		case X86_REG_XMM19: return xmmPair(19, 16);
+		case X86_REG_YMM19: return xmmPair(19, 32);
+		case X86_REG_ZMM19: return xmmPair(19, 64);
+		case X86_REG_XMM20: return xmmPair(20, 16);
+		case X86_REG_YMM20: return xmmPair(20, 32);
+		case X86_REG_ZMM20: return xmmPair(20, 64);
+		case X86_REG_XMM21: return xmmPair(21, 16);
+		case X86_REG_YMM21: return xmmPair(21, 32);
+		case X86_REG_ZMM21: return xmmPair(21, 64);
+		case X86_REG_XMM22: return xmmPair(22, 16);
+		case X86_REG_YMM22: return xmmPair(22, 32);
+		case X86_REG_ZMM22: return xmmPair(22, 64);
+		case X86_REG_XMM23: return xmmPair(23, 16);
+		case X86_REG_YMM23: return xmmPair(23, 32);
+		case X86_REG_ZMM23: return xmmPair(23, 64);
+		case X86_REG_XMM24: return xmmPair(24, 16);
+		case X86_REG_YMM24: return xmmPair(24, 32);
+		case X86_REG_ZMM24: return xmmPair(24, 64);
+		case X86_REG_XMM25: return xmmPair(25, 16);
+		case X86_REG_YMM25: return xmmPair(25, 32);
+		case X86_REG_ZMM25: return xmmPair(25, 64);
+		case X86_REG_XMM26: return xmmPair(26, 16);
+		case X86_REG_YMM26: return xmmPair(26, 32);
+		case X86_REG_ZMM26: return xmmPair(26, 64);
+		case X86_REG_XMM27: return xmmPair(27, 16);
+		case X86_REG_YMM27: return xmmPair(27, 32);
+		case X86_REG_ZMM27: return xmmPair(27, 64);
+		case X86_REG_XMM28: return xmmPair(28, 16);
+		case X86_REG_YMM28: return xmmPair(28, 32);
+		case X86_REG_ZMM28: return xmmPair(28, 64);
+		case X86_REG_XMM29: return xmmPair(29, 16);
+		case X86_REG_YMM29: return xmmPair(29, 32);
+		case X86_REG_ZMM29: return xmmPair(29, 64);
+		case X86_REG_XMM30: return xmmPair(30, 16);
+		case X86_REG_YMM30: return xmmPair(30, 32);
+		case X86_REG_ZMM30: return xmmPair(30, 64);
+		case X86_REG_XMM31: return xmmPair(31, 16);
+		case X86_REG_YMM31: return xmmPair(31, 32);
+		case X86_REG_ZMM31: return xmmPair(31, 64);
+		default: throw std::exception("Unsupported register");
+		}
+	}
 
-	std::vector<SimpleRangeMap<int, int>> addressSpaces; // for each address space: key = offset, value = variable index
-	std::vector<AnalysisVariableHistory> variables; // history
+	static std::pair<int, int> registerToRange(x86_reg reg)
+	{
+		auto [begin, size] = registerToOffsetSize(reg);
+		return{ begin, begin + size };
+	}
 };
 
-// basic blocks are sorted topological order (aka reversed post-order): a block is always ordered before it's (non-loop) successors
 export class AnalyzedFunction
 {
 public:
@@ -205,12 +363,12 @@ public:
 			std::ranges::sort(b.successors);
 		}
 
-		simplifyGraph(mapping);
 		calculateImmediateDominators();
 		calculateDominanceFrontiers();
-		emulate();
 
-		// TODO: emulate all instructions, do constant propagation and detect loads/stores/global refs/calls
+		// TODO: entry state should be customizable...
+		mCurrentState = AnalysisState::buildEntryState();
+		emulate();
 	}
 
 private:
@@ -236,47 +394,9 @@ private:
 		assert(lastTopoIndex > 0);
 		auto& assignedBlock = mBlocks[--lastTopoIndex];
 		mapping[blockIndex] = lastTopoIndex;
-		assert(assignedBlock.fblocks.empty());
-		assignedBlock.fblocks.push_back(&fblock);
+		assert(!assignedBlock.fblock);
+		assignedBlock.fblock = &fblock;
 		assignedBlock.successors = std::move(succTopoIndices);
-	}
-
-	void simplifyGraph(std::vector<int>& mapping)
-	{
-		assert(mapping.size() == mBlocks.size() && mapping[0] == 0);
-		// collapse basic blocks with single edge between them
-		// collapsible blocks are always adjacent in topological order
-		// TODO: collapse nop-only blocks: they have only 1 successor, can be killed with predecessors repointed to successor...
-		int prevIndex = 0;
-		for (int i = 1; i < mBlocks.size(); ++i)
-		{
-			auto& prev = mBlocks[prevIndex];
-			auto& curr = mBlocks[i];
-			assert(curr.fblocks.size() == 1);
-			if (curr.predecessors.size() == 1 && curr.predecessors[0] == i - 1 && prev.successors.size() == 1 && prev.successors[0] == i)
-			{
-				// collapse curr with prev
-				mapping[i] = prevIndex;
-				prev.fblocks.push_back(curr.fblocks[0]);
-				prev.successors = std::move(curr.successors);
-			}
-			else
-			{
-				// preserve block as is, compacting if needed
-				mapping[i] = ++prevIndex;
-				if (prevIndex != i)
-					mBlocks[prevIndex] = std::move(curr);
-			}
-		}
-		mBlocks.resize(++prevIndex);
-		// now that we've remapped all blocks, update edge indices
-		for (auto& b : mBlocks)
-		{
-			for (auto& e : b.successors)
-				e = mapping[e];
-			for (auto& e : b.predecessors)
-				e = mapping[e];
-		}
 	}
 
 	void calculateImmediateDominators()
@@ -338,449 +458,197 @@ private:
 		}
 	}
 
+	void buildEntryState(const AnalysisBlock& block)
+	{
+		assert(!block.predecessors.empty());
+		mCurrentState = mExitStates[block.predecessors.front()]; // TODO: move if this is the last successor...
+		ensure(block.predecessors.size() == 1); // TODO: merge...
+	}
+
 	void emulate()
 	{
 		// initial setup
-		mVariables.addressSpaces.resize(AnalysisVariables::AS_Count);
-		mVariables.variables.resize(AnalysisVariables::V_Count);
-		mVariables.variables[AnalysisVariables::V_rsp].entries[0].setPointer(0, AnalysisVariables::AS_Stack, 0);
-		for (int i = 0; i < mBlocks.size(); ++i)
+		mExitStates.resize(mBlocks.size());
+
+		emulateBlock(0);
+		for (int i = 1; i < mBlocks.size(); ++i)
 		{
-			auto& block = mBlocks[i];
-			for (auto& f : block.fblocks)
-			{
-				for (auto& isn : f->instructions)
-				{
-					switch (isn.mnem)
-					{
-					case X86_INS_MOV:
-						emulateMov(i, isn);
-						break;
-					case X86_INS_PUSH:
-						emulatePush(i, isn);
-						break;
-					case X86_INS_LEA:
-						emulateLea(i, isn);
-						break;
-					case X86_INS_ADD:
-						emulateAdd(i, isn);
-						break;
-					case X86_INS_SUB:
-						emulateSub(i, isn);
-						break;
-					case X86_INS_XOR:
-						emulateXor(i, isn);
-						break;
-					case X86_INS_BTC:
-						emulateBtc(i, isn);
-						break;
-					case X86_INS_NOP:
-					case X86_INS_JMP:
-						break;
-					default:
-						__debugbreak();
-					}
-				}
-			}
+			buildEntryState(mBlocks[i]);
+			emulateBlock(i);
 		}
 	}
 
-	void emulateLea(int iBlock, const Instruction& isn)
+	void emulateBlock(int iBlock)
+	{
+		mCurrentBlockIndex = iBlock;
+		for (auto& isn : mBlocks[iBlock].fblock->instructions)
+			emulateInstruction(isn);
+		mExitStates[iBlock] = std::move(mCurrentState);
+	}
+
+	void emulateInstruction(const Instruction& isn)
+	{
+		switch (isn.mnem)
+		{
+		case X86_INS_MOV: return emulateMov(isn);
+		case X86_INS_PUSH: return emulatePush(isn);
+		case X86_INS_LEA: return emulateLea(isn);
+		case X86_INS_ADD: return emulateAdd(isn);
+		case X86_INS_SUB: return emulateSub(isn);
+		case X86_INS_XOR: return emulateXor(isn);
+		case X86_INS_BTC: return emulateBtc(isn);
+
+		case X86_INS_NOP:
+		case X86_INS_JMP:
+			break;
+		default:
+			__debugbreak();
+		}
+	}
+
+	void emulateLea(const Instruction& isn)
 	{
 		assert(isn.opcount == 2 && isn.ops[0].type == OperandType::Reg && (isn.ops[1].type == OperandType::Mem || isn.ops[1].type == OperandType::MemRVA));
 		assert(isn.ops[0].size == 8 && isn.ops[1].size == 8);
-		auto value = calculatePointerValue(iBlock, isn, isn.ops[1].type == OperandType::MemRVA);
-		auto destIndex = variableIndexForOperand(iBlock, isn, isn.ops[0]);
-		setVariable(iBlock, destIndex, isn.rva, value);
+		auto value = operandAddress(isn, isn.ops[1]);
+		auto dest = operandAddress(isn, isn.ops[0]);
+		derefStore(dest, isn.ops[1].size, isn.rva, value);
 	}
 
-	void emulateMov(int iBlock, const Instruction& isn)
+	void emulateMov(const Instruction& isn)
 	{
 		assert(isn.opcount == 2);
-		assert(isn.ops[0].size == 8 && isn.ops[1].size == 8); // TODO: mov reg,xxx with non-8 size
-		auto value = calculateOperandValue(iBlock, isn, isn.ops[1]);
-		auto destIndex = variableIndexForOperand(iBlock, isn, isn.ops[0]);
-		setVariable(iBlock, destIndex, isn.rva, value);
+		assert(isn.ops[0].size == isn.ops[1].size);
+		auto value = read(isn, isn.ops[1]);
+		auto dest = operandAddress(isn, isn.ops[0]);
+		derefStore(dest, isn.ops[1].size, isn.rva, value);
 	}
 
-	void emulateAdd(int iBlock, const Instruction& isn)
+	void emulateAdd(const Instruction& isn)
 	{
 		assert(isn.opcount == 2);
+		assert(isn.ops[0].size == isn.ops[1].size);
+		auto dest = operandAddress(isn, isn.ops[0]);
 		if (isn.ops[0].type == OperandType::Reg && isn.ops[1].type == OperandType::Reg && isn.ops[0].reg == isn.ops[1].reg)
 		{
-			// add x, x ==> x *= 2
+			// add x, x ==> x *= 2 ???
 			__debugbreak();
 		}
 		else
 		{
-			assert(isn.ops[0].size == 8 && isn.ops[1].size == 8); // TODO: sub reg,xxx with non-8 size
-			auto value = derefSimple(calculateOperandValue(iBlock, isn, isn.ops[1]));
-			auto src = calculateOperandValue(iBlock, isn, isn.ops[0]);
-			assert(src.type == AnalysisValueType::Deref); // op can only be reg or mem => resolves to variable
-			auto modified = executeBinaryOp(derefSimple(src), AnalysisValueOp::Add, value);
-			setVariable(iBlock, src.value.var.index, isn.rva, std::move(modified));
+			assert(isn.ops[0].size == 8); // TODO: add reg,xxx with non-8 size
+			auto value = read(isn, isn.ops[1]);
+			auto modified = simplifyAdd(isn.rva, isn.ops[0].size, derefLoad(dest, isn.ops[0].size, isn.rva), value);
+			derefStore(dest, isn.ops[0].size, isn.rva, modified);
 		}
 	}
 
-	void emulateSub(int iBlock, const Instruction& isn)
+	void emulateSub(const Instruction& isn)
 	{
 		assert(isn.opcount == 2);
+		assert(isn.ops[0].size == isn.ops[1].size);
+		auto dest = operandAddress(isn, isn.ops[0]);
 		if (isn.ops[0].type == OperandType::Reg && isn.ops[1].type == OperandType::Reg && isn.ops[0].reg == isn.ops[1].reg)
 		{
 			// sub x, x ==> x = 0
-			assert(isn.ops[0].size == isn.ops[1].size);
 			assert(isn.ops[0].size >= 4); // TODO: implement partial register clears?..
-			auto src = calculateOperandValue(iBlock, isn, isn.ops[0]);
-			assert(src.type == AnalysisValueType::Deref); // op can only be reg or mem => resolves to variable
-			setVariable(iBlock, src.value.var.index, isn.rva, AnalysisValueWithType{ 0 });
+			derefStore(dest, 8, isn.rva, 0);
 		}
 		else
 		{
-			assert(isn.ops[0].size == 8 && isn.ops[1].size == 8); // TODO: sub reg,xxx with non-8 size
-			auto value = derefSimple(calculateOperandValue(iBlock, isn, isn.ops[1]));
-			auto src = calculateOperandValue(iBlock, isn, isn.ops[0]);
-			assert(src.type == AnalysisValueType::Deref); // op can only be reg or mem => resolves to variable
-			auto modified = executeBinaryOp(derefSimple(src), AnalysisValueOp::Sub, value);
-			setVariable(iBlock, src.value.var.index, isn.rva, std::move(modified));
+			assert(isn.ops[0].size == 8); // TODO: sub reg,xxx with non-8 size
+			auto value = read(isn, isn.ops[1]);
+			auto modified = simplifyAdd(isn.rva, isn.ops[0].size, derefLoad(dest, isn.ops[0].size, isn.rva), simplifyNeg(isn.rva, isn.ops[1].size, value));
+			derefStore(dest, isn.ops[0].size, isn.rva, modified);
 		}
 	}
 
-	void emulateXor(int iBlock, const Instruction& isn)
+	void emulateXor(const Instruction& isn)
 	{
 		assert(isn.opcount == 2);
+		assert(isn.ops[0].size == isn.ops[1].size);
+		auto dest = operandAddress(isn, isn.ops[0]);
 		if (isn.ops[0].type == OperandType::Reg && isn.ops[1].type == OperandType::Reg && isn.ops[0].reg == isn.ops[1].reg)
 		{
 			// xor x, x ==> x = 0
-			assert(isn.ops[0].size == isn.ops[1].size);
 			assert(isn.ops[0].size >= 4); // TODO: implement partial register clears?..
-			auto src = calculateOperandValue(iBlock, isn, isn.ops[0]);
-			assert(src.type == AnalysisValueType::Deref); // op can only be reg or mem => resolves to variable
-			setVariable(iBlock, src.value.var.index, isn.rva, AnalysisValueWithType{ 0 });
+			derefStore(dest, 8, isn.rva, 0);
 		}
 		else
 		{
 			assert(isn.ops[0].size == 8 && isn.ops[1].size == 8); // TODO: xor reg,xxx with non-8 size
-			auto value = derefSimple(calculateOperandValue(iBlock, isn, isn.ops[1]));
-			auto src = calculateOperandValue(iBlock, isn, isn.ops[0]);
-			assert(src.type == AnalysisValueType::Deref); // op can only be reg or mem => resolves to variable
-			auto modified = executeBinaryOp(derefSimple(src), AnalysisValueOp::Xor, value);
-			setVariable(iBlock, src.value.var.index, isn.rva, std::move(modified));
+			auto value = read(isn, isn.ops[1]);
+			auto modified = simplifyXor(isn.rva, isn.ops[0].size, derefLoad(dest, isn.ops[0].size, isn.rva), value);
+			derefStore(dest, isn.ops[0].size, isn.rva, modified);
 		}
 	}
 
-	void emulatePush(int iBlock, const Instruction& isn)
+	void emulatePush(const Instruction& isn)
 	{
 		assert(isn.opcount == 1 && isn.ops[0].size == 8);
 		// push x ==> sub rsp, 8 + mov [rsp], x
-		auto rspVersion = getLiveVariableVersion(iBlock, AnalysisVariables::V_rsp);
-		auto& rsp = mVariables.variables[AnalysisVariables::V_rsp].entries[rspVersion];
-		assert(rsp.op == AnalysisValueOp::Assign && rsp.operandType[0] == AnalysisValueType::Pointer);
-		auto rspVal = rsp.operandValue[0].ptr;
-		assert(rspVal.addressSpace == AnalysisVariables::AS_Stack);
-		rspVal.offset -= 8;
-		setVariable(iBlock, AnalysisVariables::V_rsp, isn.rva, AnalysisVariableValue{ rspVal });
-
-		auto value = calculateOperandValue(iBlock, isn, isn.ops[0]);
-		auto stackVar = variableIndexForPointer(rspVal, isn.ops[0].size);
-
-		setVariable(iBlock, stackVar, isn.rva, value);
+		auto rsp = AnalysisPointer{ AnalysisState::AS_Register, AnalysisState::registerToOffsetSize(X86_REG_RSP).first };
+		auto rspValue = derefLoad(rsp, 8, isn.rva);
+		assert(rspValue.type == AnalysisValueType::Pointer && rspValue.value.ptr.addressSpace == AnalysisState::AS_Stack);
+		rspValue.value.ptr -= 8;
+		derefStore(rsp, 8, isn.rva, rspValue);
+		derefStore(rspValue, isn.ops[0].size, isn.rva, read(isn, isn.ops[0]));
 	}
 
-	void emulateBtc(int iBlock, const Instruction& isn)
+	void emulateBtc(const Instruction& isn)
 	{
 		assert(isn.opcount == 2);
 		assert(isn.ops[1].type == OperandType::Imm); // TODO: handle version with register?..
 		assert(isn.ops[1].size == 1);
 		// btc x, imm ==> xor x, (1 << imm)
-		auto src = calculateOperandValue(iBlock, isn, isn.ops[0]);
-		assert(src.type == AnalysisValueType::Deref); // op can only be reg or mem => resolves to variable
-		auto modified = executeBinaryOp(derefSimple(src), AnalysisValueOp::Xor, { 1ll << isn.imm });
-		setVariable(iBlock, src.value.var.index, isn.rva, std::move(modified));
+		auto dest = operandAddress(isn, isn.ops[0]);
+		auto modified = simplifyXor(isn.rva, isn.ops[0].size, derefLoad(dest, isn.ops[0].size, isn.rva), 1ll << isn.imm);
+		derefStore(dest, isn.ops[0].size, isn.rva, modified);
 	}
 
-	AnalysisVariableValue executeBinaryOp(AnalysisValueWithType lhs, AnalysisValueOp op, AnalysisValueWithType rhs)
-	{
-		if (lhs.type == AnalysisValueType::Constant && rhs.type == AnalysisValueType::Constant)
-		{
-			// c1 op c2
-			switch (op)
-			{
-			case AnalysisValueOp::Add:
-				return{ lhs.value.constant + rhs.value.constant };
-			case AnalysisValueOp::Sub:
-				return{ lhs.value.constant - rhs.value.constant };
-			case AnalysisValueOp::Xor:
-				return{ lhs.value.constant ^ rhs.value.constant };
-			default:
-				__debugbreak();
-				return{};
-			}
-		}
-		else if (lhs.type == AnalysisValueType::Constant)
-		{
-			// c1 op v
-			auto v = derefValue(rhs);
-			switch (op)
-			{
-			case AnalysisValueOp::Add:
-				if (v.op == AnalysisValueOp::Add)
-				{
-					// c1 + (x + y)
-					if (v.operandType[0] == AnalysisValueType::Constant) // c1 + (c2 + x) ==> (c1 + c2) + x
-						return{ AnalysisValueOp::Add, AnalysisValueType::Constant, { lhs.value.constant + v.operandValue[0].constant }, v.operandType[1], v.operandValue[1] };
-					if (v.operandType[1] == AnalysisValueType::Constant) // c1 + (x + c2) ==> x + (c1 + c2)
-						return{ AnalysisValueOp::Add, v.operandType[0], v.operandValue[0], AnalysisValueType::Constant, { lhs.value.constant + v.operandValue[1].constant } };
-				}
-				else if (v.op == AnalysisValueOp::Sub)
-				{
-					// c1 + (x - y)
-					if (v.operandType[0] == AnalysisValueType::Constant) // c1 + (c2 - x) ==> (c1 + c2) - x
-						return{ AnalysisValueOp::Sub, AnalysisValueType::Constant, { lhs.value.constant + v.operandValue[0].constant }, v.operandType[1], v.operandValue[1] };
-					if (v.operandType[1] == AnalysisValueType::Constant) // c1 + (x - c2) ==> x + (c1 - c2)
-						return{ AnalysisValueOp::Add, v.operandType[0], v.operandValue[0], AnalysisValueType::Constant, { lhs.value.constant - v.operandValue[1].constant } };
-				}
-				else if (v.op == AnalysisValueOp::Assign && v.operandType[0] == AnalysisValueType::Pointer)
-				{
-					// c1 + &[x + c2] ==> &[x + (c1 + c2)]
-					return{ AnalysisPointer{ v.operandValue[0].ptr.addressSpace, static_cast<int>(v.operandValue[0].ptr.offset + lhs.value.constant) }};
-				}
-				break;
-			case AnalysisValueOp::Sub:
-				if (v.op == AnalysisValueOp::Add)
-				{
-					// c1 - (x + y)
-					if (v.operandType[0] == AnalysisValueType::Constant) // c1 - (c2 + x) ==> (c1 - c2) + x
-						return{ AnalysisValueOp::Add, AnalysisValueType::Constant, { lhs.value.constant - v.operandValue[0].constant }, v.operandType[1], v.operandValue[1] };
-					if (v.operandType[1] == AnalysisValueType::Constant) // c1 - (x + c2) ==> (c1 - c2) - x
-						return{ AnalysisValueOp::Sub, AnalysisValueType::Constant, { lhs.value.constant - v.operandValue[1].constant }, v.operandType[0], v.operandValue[0] };
-				}
-				else if (v.op == AnalysisValueOp::Sub)
-				{
-					// c1 - (x - y)
-					if (v.operandType[0] == AnalysisValueType::Constant) // c1 - (c2 - x) ==> (c1 - c2) + x
-						return{ AnalysisValueOp::Add, AnalysisValueType::Constant, { lhs.value.constant - v.operandValue[0].constant }, v.operandType[1], v.operandValue[1] };
-					if (v.operandType[1] == AnalysisValueType::Constant) // c1 - (x - c2) ==> (c1 + c2) - x
-						return{ AnalysisValueOp::Sub, AnalysisValueType::Constant, { lhs.value.constant + v.operandValue[1].constant }, v.operandType[0], v.operandValue[0] };
-				}
-				break;
-			case AnalysisValueOp::Xor:
-				if (v.op == AnalysisValueOp::Xor)
-				{
-					// c1 ^ (x ^ y)
-					if (v.operandType[0] == AnalysisValueType::Constant) // c1 ^ (c2 ^ x) ==> (c1 ^ c2) ^ x
-						return{ AnalysisValueOp::Xor, AnalysisValueType::Constant, { lhs.value.constant ^ v.operandValue[0].constant }, v.operandType[1], v.operandValue[1] };
-					if (v.operandType[1] == AnalysisValueType::Constant) // c1 ^ (x ^ c2) ==> (c1 ^ c2) ^ x
-						return{ AnalysisValueOp::Xor, AnalysisValueType::Constant, { lhs.value.constant ^ v.operandValue[1].constant }, v.operandType[0], v.operandValue[0] };
-				}
-				break;
-			}
-		}
-		else if (rhs.type == AnalysisValueType::Constant)
-		{
-			// v op c2
-			auto v = derefValue(lhs);
-			switch (op)
-			{
-			case AnalysisValueOp::Add:
-				if (v.op == AnalysisValueOp::Add)
-				{
-					// (x + y) + c2
-					if (v.operandType[0] == AnalysisValueType::Constant) // (c1 + x) + c2 ==> (c1 + c2) + x
-						return{ AnalysisValueOp::Add, AnalysisValueType::Constant, { v.operandValue[0].constant + rhs.value.constant }, v.operandType[1], v.operandValue[1] };
-					if (v.operandType[1] == AnalysisValueType::Constant) // (x + c1) + c2 ==> x + (c1 + c2)
-						return{ AnalysisValueOp::Add, v.operandType[0], v.operandValue[0], AnalysisValueType::Constant, { v.operandValue[1].constant + rhs.value.constant } };
-				}
-				else if (v.op == AnalysisValueOp::Sub)
-				{
-					// (x - y) + c2
-					if (v.operandType[0] == AnalysisValueType::Constant) // (c1 - x) + c2 ==> (c1 + c2) - x
-						return{ AnalysisValueOp::Sub, AnalysisValueType::Constant, { v.operandValue[0].constant + rhs.value.constant }, v.operandType[1], v.operandValue[1] };
-					if (v.operandType[1] == AnalysisValueType::Constant) // (x - c1) + c2 ==> x + (c2 - c1)
-						return{ AnalysisValueOp::Add, v.operandType[0], v.operandValue[0], AnalysisValueType::Constant, { rhs.value.constant - v.operandValue[1].constant } };
-				}
-				else if (v.op == AnalysisValueOp::Assign && v.operandType[0] == AnalysisValueType::Pointer)
-				{
-					// &[x + c1] + c2 ==> &[x + (c1 + c2)]
-					return{ AnalysisPointer{ v.operandValue[0].ptr.addressSpace, static_cast<int>(v.operandValue[0].ptr.offset + rhs.value.constant) } };
-				}
-				break;
-			case AnalysisValueOp::Sub:
-				if (v.op == AnalysisValueOp::Add)
-				{
-					// (x + y) - c2
-					if (v.operandType[0] == AnalysisValueType::Constant) // (c1 + x) - c2 ==> (c1 - c2) + x
-						return{ AnalysisValueOp::Add, AnalysisValueType::Constant, { v.operandValue[0].constant - rhs.value.constant }, v.operandType[1], v.operandValue[1] };
-					if (v.operandType[1] == AnalysisValueType::Constant) // (x + c1) - c2 ==> x + (c1 - c2)
-						return{ AnalysisValueOp::Add, v.operandType[0], v.operandValue[0], AnalysisValueType::Constant, { v.operandValue[1].constant - rhs.value.constant } };
-				}
-				else if (v.op == AnalysisValueOp::Sub)
-				{
-					// (x - y) - c2
-					if (v.operandType[0] == AnalysisValueType::Constant) // (c1 - x) - c2 ==> (c1 - c2) - x
-						return{ AnalysisValueOp::Sub, AnalysisValueType::Constant, { v.operandValue[0].constant - rhs.value.constant }, v.operandType[1], v.operandValue[1] };
-					if (v.operandType[1] == AnalysisValueType::Constant) // (x - c1) - c2 ==> x - (c1 + c2)
-						return{ AnalysisValueOp::Sub, v.operandType[0], v.operandValue[0], AnalysisValueType::Constant, { v.operandValue[1].constant + rhs.value.constant } };
-				}
-				else if (v.op == AnalysisValueOp::Assign && v.operandType[0] == AnalysisValueType::Pointer)
-				{
-					// &[x + c1] - c2 ==> &[x + (c1 - c2)]
-					return{ AnalysisPointer{ v.operandValue[0].ptr.addressSpace, static_cast<int>(v.operandValue[0].ptr.offset - rhs.value.constant) } };
-				}
-				break;
-			case AnalysisValueOp::Xor:
-				if (v.op == AnalysisValueOp::Xor)
-				{
-					// (x ^ y) ^ c2
-					if (v.operandType[0] == AnalysisValueType::Constant) // (c1 ^ x) ^ c2 ==> (c1 ^ c2) ^ x
-						return{ AnalysisValueOp::Xor, AnalysisValueType::Constant, { v.operandValue[0].constant ^ rhs.value.constant }, v.operandType[1], v.operandValue[1] };
-					if (v.operandType[1] == AnalysisValueType::Constant) // (x ^ c1) ^ c2 ==> x ^ (c1 ^ c2)
-						return{ AnalysisValueOp::Xor, v.operandType[0], v.operandValue[0], AnalysisValueType::Constant, { v.operandValue[1].constant ^ rhs.value.constant } };
-				}
-				break;
-			}
-		}
-		// no constant propagation possible
-		return{ op, lhs.type, lhs.value, rhs.type, rhs.value };
-	}
-
-	AnalysisValueWithType calculateOperandValue(int iBlock, const Instruction& isn, const Operand& operand)
-	{
-		switch (operand.type)
-		{
-		case OperandType::Invalid:
-			return{};
-		case OperandType::Imm:
-			return{ isn.imm };
-		case OperandType::ImmRVA:
-			return{ AnalysisPointer{ AnalysisVariables::AS_Global, static_cast<i32>(isn.imm) } };
-		default:
-			return{ variableRefForOperand(iBlock, isn, operand) };
-		}
-	}
-
-	AnalysisVariableRef variableRefForOperand(int iBlock, const Instruction& isn, const Operand& operand)
-	{
-		auto index = variableIndexForOperand(iBlock, isn, operand);
-		auto version = getLiveVariableVersion(iBlock, index);
-		return{ index, version };
-	}
-
-	int variableIndexForOperand(int iBlock, const Instruction& isn, const Operand& operand)
+	// think what 'lea' does, but also supports registers - convert reg/mem operand to an 'address'
+	// note that it might return any type (e.g. constant if operand is [addr], or an expression ref if operand is something like [rcx] where rcx value is unknown
+	// registers are converted to pointers into 'register file' address space
+	AnalysisValueWithType operandAddress(const Instruction& isn, const Operand& operand)
 	{
 		if (operand.type == OperandType::Reg)
 		{
-			return variableIndexForRegister(operand.reg, operand.size);
+			auto [offset, size] = AnalysisState::registerToOffsetSize(operand.reg);
+			assert(size == operand.size);
+			return AnalysisPointer{ AnalysisState::AS_Register, offset };
 		}
 		else
 		{
 			assert(operand.type == OperandType::Mem || operand.type == OperandType::MemRVA);
-			auto addr = calculatePointerValue(iBlock, isn, operand.type == OperandType::MemRVA);
-			assert(addr.type == AnalysisValueType::Pointer);
-			return variableIndexForPointer(addr.value.ptr, operand.size);
+			auto res = operandAddressBase(isn, operand.type == OperandType::MemRVA);
+			auto off = operandAddressOffset(isn);
+			switch (res.type)
+			{
+			case AnalysisValueType::Constant:
+				res.value.constant += off;
+				return res;
+			case AnalysisValueType::Pointer:
+				res.value.ptr.offset += off;
+				return res;
+			default:
+				return{};
+			}
 		}
 	}
 
-	int variableIndexForRegister(x86_reg reg, int opsize)
-	{
-		switch (reg)
-		{
-		case X86_REG_EAX:
-		case X86_REG_RAX:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_rax;
-		case X86_REG_ECX:
-		case X86_REG_RCX:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_rcx;
-		case X86_REG_EDX:
-		case X86_REG_RDX:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_rdx;
-		case X86_REG_EBX:
-		case X86_REG_RBX:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_rbx;
-		//case X86_REG_ESP:
-		case X86_REG_RSP:
-			assert(opsize == 8);
-			return AnalysisVariables::V_rsp;
-		case X86_REG_EBP:
-		case X86_REG_RBP:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_rbp;
-		case X86_REG_ESI:
-		case X86_REG_RSI:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_rsi;
-		case X86_REG_EDI:
-		case X86_REG_RDI:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_rdi;
-		case X86_REG_R9D:
-		case X86_REG_R9:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_r9;
-		case X86_REG_R10D:
-		case X86_REG_R10:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_r10;
-		case X86_REG_R11D:
-		case X86_REG_R11:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_r11;
-		case X86_REG_R12D:
-		case X86_REG_R12:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_r12;
-		case X86_REG_R13D:
-		case X86_REG_R13:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_r13;
-		case X86_REG_R14D:
-		case X86_REG_R14:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_r14;
-		case X86_REG_R15D:
-		case X86_REG_R15:
-			assert(opsize >= 4);
-			return AnalysisVariables::V_r15;
-		default:
-			__debugbreak();
-			return -1;
-		}
-	}
-
-	AnalysisValueWithType calculatePointerValue(int iBlock, const Instruction& isn, bool rvaBase)
-	{
-		auto res = calculatePointerValueBase(iBlock, isn, rvaBase);
-		auto off = calculatePointerValueOffset(iBlock, isn);
-		switch (res.type)
-		{
-		case AnalysisValueType::Constant:
-			res.value.constant += off;
-			return res;
-		case AnalysisValueType::Pointer:
-			res.value.ptr.offset += off;
-			return res;
-		default:
-			return{};
-		}
-	}
-
-	AnalysisValueWithType calculatePointerValueBase(int iBlock, const Instruction& isn, bool rvaBase)
+	AnalysisValueWithType operandAddressBase(const Instruction& isn, bool rvaBase)
 	{
 		if (rvaBase)
 		{
 			assert(isn.mem.segment == X86_REG_INVALID);
-			return{ AnalysisPointer{ AnalysisVariables::AS_Global } };
+			return AnalysisPointer{ AnalysisState::AS_Global };
 		}
 		else if (isn.mem.segment == X86_REG_INVALID)
 		{
 			assert(isn.mem.base != X86_REG_INVALID);
-			auto index = variableIndexForRegister(isn.mem.base, 8);
-			auto version = getLiveVariableVersion(iBlock, index);
-			auto& var = variableValue({ index, version });
-			return var.op == AnalysisValueOp::Assign ? var.getOperand(0) : AnalysisValueWithType{};
+			auto [offset, size] = AnalysisState::registerToOffsetSize(isn.mem.base);
+			assert(size == 8);
+			return derefLoad(AnalysisPointer{ AnalysisState::AS_Register, offset }, size, isn.rva);
 		}
 		else
 		{
@@ -789,110 +657,231 @@ private:
 		}
 	}
 
-	i32 calculatePointerValueOffset(int iBlock, const Instruction& isn)
+	// TODO: should it return AVWT instead?..
+	i32 operandAddressOffset(const Instruction& isn)
 	{
 		auto offset = isn.mem.disp;
 		if (isn.mem.index != X86_REG_INVALID && isn.mem.scale != 0)
 		{
-			auto index = variableIndexForRegister(isn.mem.index, 8);
-			auto version = getLiveVariableVersion(iBlock, index);
-			auto& var = variableValue({ index, version });
-			if (var.op == AnalysisValueOp::Assign && var.operandType[0] == AnalysisValueType::Constant)
-				offset += var.operandValue[0].constant;
+			auto [ioffset, isize] = AnalysisState::registerToOffsetSize(isn.mem.index);
+			assert(isize == 8);
+			auto ival = derefLoad(AnalysisPointer{ AnalysisState::AS_Register, ioffset }, isize, isn.rva);
+			if (ival.type == AnalysisValueType::Constant)
+				offset += ival.value.constant;
+			else
+				__debugbreak();
 		}
 		return offset;
 	}
 
-	int variableIndexForPointer(AnalysisPointer ptr, int size)
+	// load value stored at specified address
+	AnalysisValueWithType derefLoad(AnalysisValueWithType address, int size, rva_t rva)
 	{
-		auto& space = mVariables.addressSpaces[ptr.addressSpace];
-		auto next = space.findNext(ptr.offset);
-		auto it = space.getPrevIfContains(next, ptr.offset);
+		if (address.type == AnalysisValueType::Pointer)
+		{
+			// TODO: support overlaps
+			auto& space = mCurrentState.addressSpaces[address.value.ptr.addressSpace];
+			auto next = space.findNext(address.value.ptr.offset);
+			auto it = space.getPrevIfContains(next, address.value.ptr.offset);
+			if (it == space.end())
+			{
+				auto value = addExpression(rva, AnalysisExpression(size, address, AnalysisExpressionOp::Deref, 0));
+				space.insert({ address.value.ptr.offset, address.value.ptr.offset + size, value });
+				return value;
+			}
+			else
+			{
+				ensure(it->begin == address.value.ptr.offset && it->end == address.value.ptr.offset + size); // TODO: ...
+				return it->value;
+			}
+		}
+		// fallback - create a 'deref' expression and return a reference to it
+		return addExpression(rva, AnalysisExpression(size, address, AnalysisExpressionOp::Deref, 0));
+	}
+
+	// store specified value at specified address
+	void derefStore(AnalysisValueWithType address, int size, rva_t rva, AnalysisValueWithType value)
+	{
+		if (address.type != AnalysisValueType::Pointer)
+		{
+			__debugbreak(); // TODO: if we care, record off the side - but we can't really update the state anyway (so any potential aliasing is lost)
+			return;
+		}
+		// TODO: support overlaps
+		auto& space = mCurrentState.addressSpaces[address.value.ptr.addressSpace];
+		auto next = space.findNext(address.value.ptr.offset);
+		auto it = space.getPrevIfContains(next, address.value.ptr.offset);
 		if (it == space.end())
 		{
-			int idx = mVariables.variables.size();
-			mVariables.variables.emplace_back();
-			space.insert({ ptr.offset, ptr.offset + size, idx });
-			return idx;
+			space.insert({ address.value.ptr.offset, address.value.ptr.offset + size, value });
 		}
 		else
 		{
-			ensure(it->begin == ptr.offset && it->end == ptr.offset + size);
-			return it->value;
+			ensure(it->begin == address.value.ptr.offset && it->end == address.value.ptr.offset + size); // TODO: ...
+			space.edit(it).value = value;
 		}
 	}
 
-	int getLiveVariableVersion(int iBlock, int iVar)
+	// read value specified by an operand
+	// if value is currently undefined, creates new expression implicitly
+	AnalysisValueWithType read(const Instruction& isn, const Operand& operand)
 	{
-		auto& var = mVariables.variables[iVar];
-		for (int iVersion = var.entries.size() - 1; iVersion >= 0; --iVersion)
+		switch (operand.type)
 		{
-			auto liveness = calculateVariableLiveness(iBlock, var.entries[iVersion]);
-			if (liveness == Liveness::Reachable)
-				return iVersion;
-			if (liveness == Liveness::Partial)
-				break;
+		case OperandType::Invalid:
+			return{};
+		case OperandType::Imm:
+			return isn.imm;
+		case OperandType::ImmRVA:
+			return AnalysisPointer{ AnalysisState::AS_Global, static_cast<i32>(isn.imm) };
+		default:
+			return derefLoad(operandAddress(isn, operand), operand.size, isn.rva);
 		}
-		// TODO: create new 'unknown' version?..
-		__debugbreak();
-		return -1;
 	}
 
-	enum class Liveness { Unreachable, Reachable, Partial };
-	Liveness calculateVariableLiveness(int iBlock, const AnalysisVariableValue& var)
+	AnalysisExpressionRef addExpression(rva_t rva, AnalysisExpression expr)
 	{
-		if (var.blockIndex == iBlock)
-			return Liveness::Reachable;
-		auto idom = mBlocks[iBlock].immediateDominator;
-		if (var.blockIndex > idom)
-			return std::ranges::contains(mBlocks[var.blockIndex].dominanceFrontier, iBlock) ? Liveness::Partial : Liveness::Unreachable;
-		else if (var.blockIndex == idom)
-			return Liveness::Reachable;
-		else
-			return calculateVariableLiveness(idom, var);
+		expr.rva = rva;
+		expr.blockIndex = mCurrentBlockIndex;
+		auto index = mExpressions.size();
+		mExpressions.push_back(expr);
+		return{ index };
 	}
 
-	void setVariable(int iBlock, int iVar, rva_t rva, AnalysisValueWithType val) { setVariable(iBlock, iVar, rva, derefValue(val)); }
-	void setVariable(int iBlock, int iVar, rva_t rva, AnalysisVariableValue&& value)
+	AnalysisValueWithType simplifyNeg(rva_t rva, int size, AnalysisValueWithType v)
 	{
-		if (value.operandType[0] == AnalysisValueType::Deref)
-			++variableValue(value.operandValue[0].var).numRefs;
-		if (value.operandType[1] == AnalysisValueType::Deref)
-			++variableValue(value.operandValue[1].var).numRefs;
+		if (v.type == AnalysisValueType::Constant)
+			return -v.value.constant;
 
-		auto& var = mVariables.variables[iVar];
-		if (var.entries.back().blockIndex == iBlock && var.entries.back().numRefs == 0)
-			var.entries.pop_back();
-		value.assignment = rva;
-		value.blockIndex = iBlock;
-		var.entries.push_back(std::move(value));
-	}
-
-	AnalysisVariableValue& variableValue(AnalysisVariableRef ref) { return mVariables.variables[ref.index].entries[ref.version]; }
-
-	AnalysisValueWithType derefSimple(AnalysisValueWithType val)
-	{
-		if (val.type == AnalysisValueType::Deref)
+		if (v.type == AnalysisValueType::Expression)
 		{
-			auto& value = variableValue(val.value.var);
-			if (value.op == AnalysisValueOp::Assign && value.operandType[0] != AnalysisValueType::Unknown)
-				return value.getOperand(0);
+			auto& e = mExpressions[v.value.expr.index];
+			switch (e.op)
+			{
+			case AnalysisExpressionOp::Neg: return e.getOperand(0); // -(-x) == x
+			case AnalysisExpressionOp::Add: return simplifyAdd(rva, size, simplifyNeg(rva, size, e.getOperand(0)), simplifyNeg(rva, size, e.getOperand(1))); // -(a + b) == (-a) + (-b)
+			}
 		}
-		return val;
+
+		return addExpression(rva, { size, AnalysisExpressionOp::Neg, v });
 	}
 
-	AnalysisVariableValue derefValue(AnalysisValueWithType ref)
+	AnalysisValueWithType simplifyAdd(rva_t rva, int size, AnalysisValueWithType lhs, AnalysisValueWithType rhs)
 	{
-		if (ref.type == AnalysisValueType::Deref)
+		commAssocSwapIfNeeded(lhs, AnalysisExpressionOp::Add, rhs);
+
+		if (lhs.type == AnalysisValueType::Constant)
 		{
-			auto& value = variableValue(ref.value.var);
-			if (!value.isUnknown())
-				return value;
+			assert(rhs.type == AnalysisValueType::Constant); // otherwise we'd have swapped
+			return lhs.value.constant + rhs.value.constant;
 		}
-		return{ ref };
+
+		if (lhs.type == AnalysisValueType::Pointer && rhs.type == AnalysisValueType::Constant)
+		{
+			return lhs.value.ptr + rhs.value.constant;
+		}
+
+		if (rhs.type == AnalysisValueType::Expression && mExpressions[rhs.value.expr.index].op == AnalysisExpressionOp::Add)
+		{
+			assert(lhs.type == AnalysisValueType::Expression && mExpressions[lhs.value.expr.index].op == AnalysisExpressionOp::Add); // otherwise we'd have swapped
+			// (a + b) + (c + d) ==> ((a + b) + c) + d
+			auto& r = mExpressions[rhs.value.expr.index];
+			lhs = simplifyAdd(rva, size, lhs, r.getOperand(0));
+			rhs = r.getOperand(1);
+		}
+
+		if (lhs.type == AnalysisValueType::Expression && mExpressions[lhs.value.expr.index].op == AnalysisExpressionOp::Add)
+		{
+			auto& l = mExpressions[lhs.value.expr.index];
+			assert(l.operandType[1] != AnalysisValueType::Expression || mExpressions[l.operandValue[1].expr.index].op != AnalysisExpressionOp::Add); // this would violate associativity form
+			if (rhs.type == AnalysisValueType::Constant && (l.operandType[1] == AnalysisValueType::Constant || l.operandType[1] == AnalysisValueType::Pointer))
+			{
+				// (x + ptr/c1) + c2 ==> x + (ptr/c1 + c2)
+				rhs = simplifyAdd(rva, size, l.getOperand(1), rhs);
+				assert(rhs.type == AnalysisValueType::Constant || rhs.type == AnalysisValueType::Pointer);
+				lhs = l.getOperand(0);
+				assert(lhs.type == AnalysisValueType::Pointer || lhs.type == AnalysisValueType::Expression);
+			}
+			else if (priorityForCommAssoc(l.getOperand(1), AnalysisExpressionOp::Add) < priorityForCommAssoc(rhs, AnalysisExpressionOp::Add))
+			{
+				// something like (x + const) + expr ==> (x + expr) + const
+				lhs = simplifyAdd(rva, size, l.getOperand(0), rhs);
+				rhs = l.getOperand(1);
+			}
+		}
+
+		// TODO: ((a + b) + c) + (-a) ==> b + c
+		// TODO: ptr(ASx) + neg(ptr(ASx)) ==> constant
+		// TODO: a * b + c * b ==> (a + c) * b
+		return addExpression(rva, { size, lhs, AnalysisExpressionOp::Add, rhs });
+	}
+
+	AnalysisValueWithType simplifyXor(rva_t rva, int size, AnalysisValueWithType lhs, AnalysisValueWithType rhs)
+	{
+		commAssocSwapIfNeeded(lhs, AnalysisExpressionOp::Xor, rhs);
+
+		if (lhs.type == AnalysisValueType::Constant)
+		{
+			assert(rhs.type == AnalysisValueType::Constant); // otherwise we'd have swapped
+			return lhs.value.constant ^ rhs.value.constant;
+		}
+
+		if (rhs.type == AnalysisValueType::Expression && mExpressions[rhs.value.expr.index].op == AnalysisExpressionOp::Xor)
+		{
+			assert(lhs.type == AnalysisValueType::Expression && mExpressions[lhs.value.expr.index].op == AnalysisExpressionOp::Xor); // otherwise we'd have swapped
+			// (a ^ b) ^ (c ^ d) ==> ((a ^ b) ^ c) ^ d
+			auto& r = mExpressions[rhs.value.expr.index];
+			lhs = simplifyXor(rva, size, lhs, r.getOperand(0));
+			rhs = r.getOperand(1);
+		}
+
+		if (lhs.type == AnalysisValueType::Expression && mExpressions[lhs.value.expr.index].op == AnalysisExpressionOp::Xor)
+		{
+			auto& l = mExpressions[lhs.value.expr.index];
+			assert(l.operandType[1] != AnalysisValueType::Expression || mExpressions[l.operandValue[1].expr.index].op != AnalysisExpressionOp::Xor); // this would violate associativity form
+			if (rhs.type == AnalysisValueType::Constant && l.operandType[1] == AnalysisValueType::Constant)
+			{
+				// (x ^ c1) ^ c2 ==> x ^ (c1 ^ c2)
+				rhs = l.operandValue[1].constant ^ rhs.value.constant;
+				assert(rhs.type == AnalysisValueType::Constant);
+				lhs = l.getOperand(0);
+				assert(lhs.type == AnalysisValueType::Pointer || lhs.type == AnalysisValueType::Expression);
+			}
+			else if (priorityForCommAssoc(l.getOperand(1), AnalysisExpressionOp::Xor) < priorityForCommAssoc(rhs, AnalysisExpressionOp::Xor))
+			{
+				// something like (x ^ const) ^ expr ==> (x ^ expr) ^ const
+				lhs = simplifyXor(rva, size, l.getOperand(0), rhs);
+				rhs = l.getOperand(1);
+			}
+		}
+
+		// TODO: ((a ^ b) ^ c) ^ a ==> b ^ c
+		return addExpression(rva, { size, lhs, AnalysisExpressionOp::Xor, rhs });
+	}
+
+	// associativeness: nested is always on the left
+	// commutativeness: constant > pointer > other-op expr > same-op expr priority for right-side, this simplifies constant propagation
+	int priorityForCommAssoc(AnalysisValueWithType v, AnalysisExpressionOp op)
+	{
+		switch (v.type)
+		{
+		case AnalysisValueType::Constant: return 0;
+		case AnalysisValueType::Pointer: return 1;
+		case AnalysisValueType::Expression: return mExpressions[v.value.expr.index].op == op ? 3 : 2;
+		default: throw std::exception("Bad type");
+		}
+	}
+
+	void commAssocSwapIfNeeded(AnalysisValueWithType& lhs, AnalysisExpressionOp op, AnalysisValueWithType& rhs)
+	{
+		if (priorityForCommAssoc(lhs, op) < priorityForCommAssoc(rhs, op))
+			std::swap(rhs, lhs);
 	}
 
 private:
-	std::vector<BasicBlock> mBlocks; // sorted in topological (reverse-post) order
-	AnalysisVariables mVariables;
+	std::vector<AnalysisBlock> mBlocks; // sorted in topological (reverse-post) order
+	std::vector<AnalysisState> mExitStates;
+	std::vector<AnalysisExpression> mExpressions;
+	int mCurrentBlockIndex = -1;
+	AnalysisState mCurrentState; // for currently emulated block
 };
