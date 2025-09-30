@@ -67,18 +67,19 @@ public:
 
 	// insert new entry; ensures it does not overlap with anything else
 	// if hint is provided, it should point to the next entry
-	void insert(Entry&& e, auto hint)
+	// returns iterator pointing to inserted element
+	auto insert(Entry&& e, auto hint)
 	{
 		ensure(e.begin < e.end);
 		ensure(hint == mEntries.end() || hint->begin >= e.end);
 		ensure(hint == mEntries.begin() || (hint - 1)->end <= e.begin);
-		mEntries.emplace(hint, std::move(e));
+		return mEntries.emplace(hint, std::move(e));
 	}
 
-	void insert(Entry&& e)
+	auto insert(Entry&& e)
 	{
 		auto next = findNext(e.begin);
-		insert(std::move(e), next);
+		return insert(std::move(e), next);
 	}
 
 	// extend preceeding entry to include new range
@@ -105,6 +106,9 @@ public:
 		edit(iter).begin = begin;
 		edit(iter).end = end;
 	}
+
+	// remove a subrange
+	auto erase(auto begin, auto end) { return mEntries.erase(begin, end); }
 
 private:
 	std::vector<Entry> mEntries; // invariant: [i].begin < [i].end <= [i+1].begin

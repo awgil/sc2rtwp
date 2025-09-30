@@ -72,12 +72,12 @@ enum class AnalysisExpressionOp : u8
 	Invalid,
 
 	// unary expressions
+	Deref, // = *op1
 	Neg, // = -op1
 	Not, // = ~op1
 	LastUnary,
 
 	// binary expressions
-	Deref, // = *(op1 + op2) (op1 is base address, op2 is an offset - constant or variable)
 	Add, // = op1 + op2
 	Xor, // = op1 ^ op2
 	LastBinary,
@@ -105,10 +105,6 @@ struct AnalysisExpression
 
 	// unary op
 	AnalysisExpression(int size, AnalysisExpressionOp op, AnalysisValueWithType value) : AnalysisExpression(size, value, op, {}) {}
-	//AnalysisExpression(i64 value) : AnalysisVariableValue(AnalysisValueType::Constant, { .constant = value }) {}
-	//AnalysisExpression(AnalysisPointer value) : AnalysisVariableValue(AnalysisValueType::Pointer, { .ptr = value }) {}
-	//AnalysisExpression(AnalysisVariableRef value) : AnalysisVariableValue(AnalysisValueType::Deref, { .var = value }) {}
-	//AnalysisExpression(AnalysisValueWithType val) : AnalysisVariableValue(val.type, val.value) {}
 
 	AnalysisValueWithType getOperand(int index) const { return{ operandType[index], operandValue[index] }; }
 	void setOperand(int index, AnalysisValueWithType value)
@@ -116,13 +112,6 @@ struct AnalysisExpression
 		operandType[index] = value.type;
 		operandValue[index] = value.value;
 	}
-
-	//void setUnknown(int index) { setOperand(index, AnalysisValueType::Unknown, { .constant = 0 }); }
-	//void setConstant(int index, i64 value) { setOperand(index, AnalysisValueType::Constant, { .constant = value }); }
-	//void setPointer(int index, AnalysisPointer value) { setOperand(index, AnalysisValueType::Pointer, { .ptr = value }); }
-	//void setPointer(int index, int addressSpace, int offset) { setPointer(index, { addressSpace, offset }); }
-	//void setExpression(int index, AnalysisExpressionRef value) { setOperand(index, AnalysisValueType::Expression, { .expr = value }); }
-	//void setExpression(int index, size_t var) { setExpression(index, AnalysisExpressionRef{ var }); }
 };
 
 // known memory state
@@ -132,11 +121,13 @@ struct AnalysisState
 
 	enum StandardAddressSpaces
 	{
-		AS_Unknown,
 		AS_Register, // offset depends on register id
 		AS_Global, // offset = rva
 		AS_Stack, // offset 0 is retaddr
-		AS_Thread, // gs:[offset]
+		AS_TEB, // gs:[offset], contains TEB
+		AS_PEB,
+		AS_LoaderData, // in PEB
+		AS_LoaderDataEntry,
 
 		AS_Count
 	};
@@ -147,6 +138,21 @@ struct AnalysisState
 		res.addressSpaces.resize(AS_Count);
 		auto [rspStart, rspEnd] = registerToRange(X86_REG_RSP);
 		res.addressSpaces[AS_Register].insert({ rspStart, rspEnd, AnalysisPointer{ AS_Stack }});
+		res.addressSpaces[AS_TEB].insert({ 0x30, 0x38, AnalysisPointer{ AS_TEB } }); // NtTib.Self
+		res.addressSpaces[AS_TEB].insert({ 0x60, 0x68, AnalysisPointer{ AS_PEB } });
+		res.addressSpaces[AS_PEB].insert({ 0x18, 0x20, AnalysisPointer{ AS_LoaderData } });
+		res.addressSpaces[AS_LoaderData].insert({ 0x10, 0x18, AnalysisPointer{ AS_LoaderDataEntry } }); // InLoadOrderModuleList
+		res.addressSpaces[AS_LoaderData].insert({ 0x18, 0x20, AnalysisPointer{ AS_LoaderDataEntry } });
+		res.addressSpaces[AS_LoaderData].insert({ 0x20, 0x28, AnalysisPointer{ AS_LoaderDataEntry, 0x10 } }); // InMemoryOrderModuleList
+		res.addressSpaces[AS_LoaderData].insert({ 0x28, 0x30, AnalysisPointer{ AS_LoaderDataEntry, 0x10 } });
+		res.addressSpaces[AS_LoaderData].insert({ 0x30, 0x38, AnalysisPointer{ AS_LoaderDataEntry, 0x20 } }); // InInitializationOrderModuleList
+		res.addressSpaces[AS_LoaderData].insert({ 0x38, 0x40, AnalysisPointer{ AS_LoaderDataEntry, 0x20 } });
+		res.addressSpaces[AS_LoaderDataEntry].insert({ 0x0, 0x8, AnalysisPointer{ AS_LoaderDataEntry } }); // InLoadOrderLinks
+		res.addressSpaces[AS_LoaderDataEntry].insert({ 0x8, 0x10, AnalysisPointer{ AS_LoaderDataEntry } });
+		res.addressSpaces[AS_LoaderDataEntry].insert({ 0x10, 0x18, AnalysisPointer{ AS_LoaderDataEntry, 0x10 } }); // InMemoryOrderLinks
+		res.addressSpaces[AS_LoaderDataEntry].insert({ 0x18, 0x20, AnalysisPointer{ AS_LoaderDataEntry, 0x10 } });
+		res.addressSpaces[AS_LoaderDataEntry].insert({ 0x20, 0x28, AnalysisPointer{ AS_LoaderDataEntry, 0x20 } }); // InInitializationOrderLinks
+		res.addressSpaces[AS_LoaderDataEntry].insert({ 0x28, 0x30, AnalysisPointer{ AS_LoaderDataEntry, 0x20 } });
 		return res;
 	}
 
@@ -367,8 +373,7 @@ public:
 		calculateDominanceFrontiers();
 
 		// TODO: entry state should be customizable...
-		mCurrentState = AnalysisState::buildEntryState();
-		emulate();
+		emulate(AnalysisState::buildEntryState());
 	}
 
 private:
@@ -458,22 +463,30 @@ private:
 		}
 	}
 
-	void buildEntryState(const AnalysisBlock& block)
+	AnalysisState buildEntryState(int iBlock)
 	{
+		auto& block = mBlocks[iBlock];
 		assert(!block.predecessors.empty());
-		mCurrentState = mExitStates[block.predecessors.front()]; // TODO: move if this is the last successor...
-		ensure(block.predecessors.size() == 1); // TODO: merge...
+		AnalysisState state = mExitStates[block.predecessors.front()]; // TODO: move if this is the last successor...
+		for (auto i : block.predecessors | std::ranges::views::drop(1))
+		{
+			if (i >= iBlock)
+				continue; // loop link
+			ensure(false); // TODO: merge...
+		}
+		return state;
 	}
 
-	void emulate()
+	void emulate(AnalysisState&& initialState)
 	{
 		// initial setup
 		mExitStates.resize(mBlocks.size());
 
+		mExitStates[0] = std::move(initialState);
 		emulateBlock(0);
 		for (int i = 1; i < mBlocks.size(); ++i)
 		{
-			buildEntryState(mBlocks[i]);
+			mExitStates[i] = buildEntryState(i);
 			emulateBlock(i);
 		}
 	}
@@ -483,7 +496,6 @@ private:
 		mCurrentBlockIndex = iBlock;
 		for (auto& isn : mBlocks[iBlock].fblock->instructions)
 			emulateInstruction(isn);
-		mExitStates[iBlock] = std::move(mCurrentState);
 	}
 
 	void emulateInstruction(const Instruction& isn)
@@ -498,6 +510,28 @@ private:
 		case X86_INS_XOR: return emulateXor(isn);
 		case X86_INS_BTC: return emulateBtc(isn);
 
+		case X86_INS_CMP:
+		case X86_INS_TEST:
+			return; // no-op, unless we start caring about flags
+
+		case X86_INS_JO:
+		case X86_INS_JNO:
+		case X86_INS_JS:
+		case X86_INS_JNS:
+		case X86_INS_JE:
+		case X86_INS_JNE:
+		case X86_INS_JB:
+		case X86_INS_JAE:
+		case X86_INS_JP:
+		case X86_INS_JNP:
+		case X86_INS_JBE:
+		case X86_INS_JA:
+		case X86_INS_JL:
+		case X86_INS_JGE:
+		case X86_INS_JLE:
+		case X86_INS_JG:
+			return; // conditional jumps...
+
 		case X86_INS_NOP:
 		case X86_INS_JMP:
 			break;
@@ -510,37 +544,31 @@ private:
 	{
 		assert(isn.opcount == 2 && isn.ops[0].type == OperandType::Reg && (isn.ops[1].type == OperandType::Mem || isn.ops[1].type == OperandType::MemRVA));
 		assert(isn.ops[0].size == 8 && isn.ops[1].size == 8);
-		auto value = operandAddress(isn, isn.ops[1]);
 		auto dest = operandAddress(isn, isn.ops[0]);
-		derefStore(dest, isn.ops[1].size, isn.rva, value);
+		auto value = operandAddress(isn, isn.ops[1]);
+		derefStore(dest, isn.ops[0].size, isn.rva, value);
 	}
 
 	void emulateMov(const Instruction& isn)
 	{
 		assert(isn.opcount == 2);
 		assert(isn.ops[0].size == isn.ops[1].size);
-		auto value = read(isn, isn.ops[1]);
+		if (isn.ops[0].type == OperandType::Reg && isn.ops[1].type == OperandType::Reg && isn.ops[0].reg == isn.ops[1].reg)
+			return; // mov x, x is a no-op
 		auto dest = operandAddress(isn, isn.ops[0]);
-		derefStore(dest, isn.ops[1].size, isn.rva, value);
+		auto value = read(isn, isn.ops[1]);
+		derefStore(dest, isn.ops[0].size, isn.rva, value);
 	}
 
 	void emulateAdd(const Instruction& isn)
 	{
+		// TODO: add x, x ==> x *= 2 ??? or this should be handled by simplifier?
 		assert(isn.opcount == 2);
 		assert(isn.ops[0].size == isn.ops[1].size);
 		auto dest = operandAddress(isn, isn.ops[0]);
-		if (isn.ops[0].type == OperandType::Reg && isn.ops[1].type == OperandType::Reg && isn.ops[0].reg == isn.ops[1].reg)
-		{
-			// add x, x ==> x *= 2 ???
-			__debugbreak();
-		}
-		else
-		{
-			assert(isn.ops[0].size == 8); // TODO: add reg,xxx with non-8 size
-			auto value = read(isn, isn.ops[1]);
-			auto modified = simplifyAdd(isn.rva, isn.ops[0].size, derefLoad(dest, isn.ops[0].size, isn.rva), value);
-			derefStore(dest, isn.ops[0].size, isn.rva, modified);
-		}
+		auto value = read(isn, isn.ops[1]);
+		auto modified = simplifyAdd(isn.rva, isn.ops[0].size, derefLoad(dest, isn.ops[0].size, isn.rva), value);
+		derefStore(dest, isn.ops[0].size, isn.rva, modified);
 	}
 
 	void emulateSub(const Instruction& isn)
@@ -552,7 +580,7 @@ private:
 		{
 			// sub x, x ==> x = 0
 			assert(isn.ops[0].size >= 4); // TODO: implement partial register clears?..
-			derefStore(dest, 8, isn.rva, 0);
+			derefStore(dest, isn.ops[0].size, isn.rva, 0);
 		}
 		else
 		{
@@ -572,11 +600,10 @@ private:
 		{
 			// xor x, x ==> x = 0
 			assert(isn.ops[0].size >= 4); // TODO: implement partial register clears?..
-			derefStore(dest, 8, isn.rva, 0);
+			derefStore(dest, isn.ops[0].size, isn.rva, 0);
 		}
 		else
 		{
-			assert(isn.ops[0].size == 8 && isn.ops[1].size == 8); // TODO: xor reg,xxx with non-8 size
 			auto value = read(isn, isn.ops[1]);
 			auto modified = simplifyXor(isn.rva, isn.ops[0].size, derefLoad(dest, isn.ops[0].size, isn.rva), value);
 			derefStore(dest, isn.ops[0].size, isn.rva, modified);
@@ -630,7 +657,10 @@ private:
 			case AnalysisValueType::Pointer:
 				res.value.ptr.offset += off;
 				return res;
+			case AnalysisValueType::Expression:
+				return simplifyAdd(isn.rva, 8, res, off);
 			default:
+				__debugbreak();
 				return{};
 			}
 		}
@@ -649,6 +679,21 @@ private:
 			auto [offset, size] = AnalysisState::registerToOffsetSize(isn.mem.base);
 			assert(size == 8);
 			return derefLoad(AnalysisPointer{ AnalysisState::AS_Register, offset }, size, isn.rva);
+		}
+		else if (isn.mem.segment == X86_REG_GS)
+		{
+			auto offset = 0;
+			if (isn.mem.base != X86_REG_INVALID)
+			{
+				auto [boffset, bsize] = AnalysisState::registerToOffsetSize(isn.mem.base);
+				assert(bsize == 8);
+				auto bval = derefLoad(AnalysisPointer{ AnalysisState::AS_Register, boffset }, bsize, isn.rva);
+				if (bval.type == AnalysisValueType::Constant)
+					offset += bval.value.constant;
+				else
+					__debugbreak();
+			}
+			return AnalysisPointer{ AnalysisState::AS_TEB, offset };
 		}
 		else
 		{
@@ -677,49 +722,169 @@ private:
 	// load value stored at specified address
 	AnalysisValueWithType derefLoad(AnalysisValueWithType address, int size, rva_t rva)
 	{
-		if (address.type == AnalysisValueType::Pointer)
+		if (address.type != AnalysisValueType::Pointer)
+			return addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address)); // fallback, we don't know how to dereference non-pointer properly
+
+		auto entryEnd = address.value.ptr.offset + size;
+		auto& space = mExitStates[mCurrentBlockIndex].addressSpaces[address.value.ptr.addressSpace];
+		auto next = space.findNext(address.value.ptr.offset);
+		if (next != space.end() && next->begin < entryEnd)
 		{
-			// TODO: support overlaps
-			auto& space = mCurrentState.addressSpaces[address.value.ptr.addressSpace];
-			auto next = space.findNext(address.value.ptr.offset);
-			auto it = space.getPrevIfContains(next, address.value.ptr.offset);
-			if (it == space.end())
-			{
-				auto value = addExpression(rva, AnalysisExpression(size, address, AnalysisExpressionOp::Deref, 0));
-				space.insert({ address.value.ptr.offset, address.value.ptr.offset + size, value });
-				return value;
-			}
-			else
-			{
-				ensure(it->begin == address.value.ptr.offset && it->end == address.value.ptr.offset + size); // TODO: ...
-				return it->value;
-			}
+			// partial overlap with high bytes
+			// TODO: merge constants...
+			__debugbreak();
+			return addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address));
 		}
-		// fallback - create a 'deref' expression and return a reference to it
-		return addExpression(rva, AnalysisExpression(size, address, AnalysisExpressionOp::Deref, 0));
+
+		if (next == space.begin() || (next - 1)->end <= address.value.ptr.offset)
+		{
+			// read of fully uninitialized memory
+			// add a new expression, so that subsequent reads return same one
+			auto value = addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address));
+			space.insert({ address.value.ptr.offset, address.value.ptr.offset + size, value });
+			return value;
+		}
+
+		auto prev = next - 1;
+		if (prev->begin < address.value.ptr.offset)
+		{
+			// partial overlap with low bytes
+			// TODO: merge constants...
+			__debugbreak();
+			return addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address));
+		}
+
+		if (prev->end == entryEnd)
+		{
+			// good path
+			return prev->value;
+		}
+		else if (prev->end < entryEnd)
+		{
+			// read of partially written value - what to do?..
+			__debugbreak();
+			return addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address));
+		}
+		else if (prev->value.type != AnalysisValueType::Constant)
+		{
+			// TODO: partial read of non-constant - what to do?.. can have something like & 0xFFFF....
+			__debugbreak();
+			return addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address));
+		}
+		else
+		{
+			auto value = prev->value.value.constant & ((1ull << 8 * size) - 1);
+			return makeConstant(value, size);
+		}
 	}
 
 	// store specified value at specified address
 	void derefStore(AnalysisValueWithType address, int size, rva_t rva, AnalysisValueWithType value)
 	{
+		assert(value.type != AnalysisValueType::Unknown);
+		ensure(value.type != AnalysisValueType::Pointer || size == 8); // chopping pointers is probably not correct?..
+		ensure(value.type != AnalysisValueType::Expression || mExpressions[value.value.expr.index].size == size); // ???
+
 		if (address.type != AnalysisValueType::Pointer)
 		{
 			__debugbreak(); // TODO: if we care, record off the side - but we can't really update the state anyway (so any potential aliasing is lost)
 			return;
 		}
-		// TODO: support overlaps
-		auto& space = mCurrentState.addressSpaces[address.value.ptr.addressSpace];
+
+		if (address.value.ptr.addressSpace == AnalysisState::AS_Register && size == 4)
+		{
+			// dword register writes automatically clear high dword
+			size = 8;
+			if (value.type == AnalysisValueType::Constant)
+				value.value.constant &= 0xFFFFFFFF;
+			// TODO: for expressions - consider wrapping into a zero-extend unary op?.. might complicate things a bit...
+		}
+
+		auto entryEnd = address.value.ptr.offset + size;
+		auto& space = mExitStates[mCurrentBlockIndex].addressSpaces[address.value.ptr.addressSpace];
 		auto next = space.findNext(address.value.ptr.offset);
-		auto it = space.getPrevIfContains(next, address.value.ptr.offset);
-		if (it == space.end())
+		if (next != space.end() && next->begin < entryEnd)
 		{
-			space.insert({ address.value.ptr.offset, address.value.ptr.offset + size, value });
+			// we have some partial overlaps - full overlaps can be deleted (since they are fully overwritten)
+			auto overlapEnd = next + 1;
+			while (overlapEnd != space.end() && overlapEnd->end <= entryEnd)
+				++overlapEnd;
+
+			if (overlapEnd != space.end() && overlapEnd->begin < entryEnd)
+			{
+				// partial overlap - some low bytes are to be discarded
+				// TODO: implement as generic byte-extract / shift?..
+				if (overlapEnd->value.type == AnalysisValueType::Constant)
+				{
+					space.edit(overlapEnd).value.value.constant >>= 8 * (entryEnd - overlapEnd->begin);
+					space.shrink(entryEnd, overlapEnd->end, overlapEnd);
+				}
+				else
+				{
+					__debugbreak();
+					++overlapEnd; // forgetting stuff always works...
+				}
+			}
+
+			next = space.erase(next, overlapEnd);
 		}
-		else
+		// at this point, if next exists, it does not overlap the entry
+
+		if (next == space.begin() || (next - 1)->end <= address.value.ptr.offset)
 		{
-			ensure(it->begin == address.value.ptr.offset && it->end == address.value.ptr.offset + size); // TODO: ...
-			space.edit(it).value = value;
+			// no overlaps, just insert new entry
+			space.insert({ address.value.ptr.offset, entryEnd, value }, next);
+			return;
 		}
+
+		// ok, so there's some overlap between existing and new ranges - we might have bytes to chop on either side, and then might need to extend the remaining entry
+		auto prev = next - 1;
+		if (prev->begin < address.value.ptr.offset)
+		{
+			// insert new entry before prev containing chopped off low bytes
+			// TODO: implement this generically?
+			if (prev->value.type == AnalysisValueType::Constant)
+			{
+				auto addr = prev->begin;
+				AnalysisValueWithType low = prev->value.value.constant & ((1ull << 8 * (address.value.ptr.offset - prev->begin)) - 1);
+				space.shrink(address.value.ptr.offset, prev->end, prev);
+				prev = space.insert({ addr, address.value.ptr.offset, low }, prev);
+			}
+			else
+			{
+				// just shrink the entry, effectively forgetting low bytes
+				__debugbreak();
+				space.shrink(address.value.ptr.offset, prev->end, prev);
+			}
+		}
+
+		if (prev->end > entryEnd)
+		{
+			// insert new entry after prev containing chopped off high bytes
+			// TODO: implement as generic byte-extract / shift?..
+			if (prev->value.type == AnalysisValueType::Constant)
+			{
+				auto end = prev->end;
+				AnalysisValueWithType high = prev->value.value.constant >> 8 * (end - entryEnd);
+				space.shrink(prev->begin, entryEnd, prev);
+				prev = space.insert({ entryEnd, end, high }, prev + 1) - 1;
+			}
+			else
+			{
+				// just shrink the entry, effectively forgetting high bytes
+				__debugbreak();
+				space.shrink(prev->begin, entryEnd, prev);
+			}
+		}
+
+		if (prev->end < entryEnd)
+		{
+			// existing entry just needs to be extended - this is fine, we'll overwrite it fully
+			space.extend(prev->begin, entryEnd, prev);
+		}
+
+		// happy path - existing entry covers exactly same region as new one, so just overwrite
+		space.edit(prev).value = value;
 	}
 
 	// read value specified by an operand
@@ -731,7 +896,7 @@ private:
 		case OperandType::Invalid:
 			return{};
 		case OperandType::Imm:
-			return isn.imm;
+			return makeConstant(isn.imm, operand.size);
 		case OperandType::ImmRVA:
 			return AnalysisPointer{ AnalysisState::AS_Global, static_cast<i32>(isn.imm) };
 		default:
@@ -748,10 +913,22 @@ private:
 		return{ index };
 	}
 
+	AnalysisValueWithType makeConstant(i64 value, int size)
+	{
+		switch (size)
+		{
+		case 1: return (i8)value;
+		case 2: return (i16)value;
+		case 4: return (i32)value;
+		case 8: return (i64)value;
+		default: throw std::exception("Unexpected size");
+		}
+	}
+
 	AnalysisValueWithType simplifyNeg(rva_t rva, int size, AnalysisValueWithType v)
 	{
 		if (v.type == AnalysisValueType::Constant)
-			return -v.value.constant;
+			return makeConstant(-v.value.constant, size);
 
 		if (v.type == AnalysisValueType::Expression)
 		{
@@ -773,7 +950,7 @@ private:
 		if (lhs.type == AnalysisValueType::Constant)
 		{
 			assert(rhs.type == AnalysisValueType::Constant); // otherwise we'd have swapped
-			return lhs.value.constant + rhs.value.constant;
+			return makeConstant(lhs.value.constant + rhs.value.constant, size);
 		}
 
 		if (lhs.type == AnalysisValueType::Pointer && rhs.type == AnalysisValueType::Constant)
@@ -823,7 +1000,7 @@ private:
 		if (lhs.type == AnalysisValueType::Constant)
 		{
 			assert(rhs.type == AnalysisValueType::Constant); // otherwise we'd have swapped
-			return lhs.value.constant ^ rhs.value.constant;
+			return makeConstant(lhs.value.constant ^ rhs.value.constant, size);
 		}
 
 		if (rhs.type == AnalysisValueType::Expression && mExpressions[rhs.value.expr.index].op == AnalysisExpressionOp::Xor)
@@ -883,5 +1060,4 @@ private:
 	std::vector<AnalysisState> mExitStates;
 	std::vector<AnalysisExpression> mExpressions;
 	int mCurrentBlockIndex = -1;
-	AnalysisState mCurrentState; // for currently emulated block
 };
