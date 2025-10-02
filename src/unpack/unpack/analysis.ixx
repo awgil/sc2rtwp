@@ -66,6 +66,7 @@ struct AnalysisValueWithType
 	AnalysisValueWithType(AnalysisExpressionRef value) : type(AnalysisValueType::Expression), value{ .expr = value } {}
 	AnalysisValueWithType(AnalysisValueType type, AnalysisValue value) : type(type), value(value) {}
 };
+bool operator==(const AnalysisValueWithType& l, const AnalysisValueWithType& r) { return l.type == r.type && l.value.constant == r.value.constant; }
 
 enum class AnalysisExpressionOp : u8
 {
@@ -75,11 +76,14 @@ enum class AnalysisExpressionOp : u8
 	Deref, // = *op1
 	Neg, // = -op1
 	Not, // = ~op1
+	ZeroExtend, // = zero-extended op1
 	LastUnary,
 
 	// binary expressions
 	Add, // = op1 + op2
+	MulLo, // = op1 * op2
 	Xor, // = op1 ^ op2
+	Or, // = op1 | op2
 	LastBinary,
 };
 
@@ -503,11 +507,15 @@ private:
 		switch (isn.mnem)
 		{
 		case X86_INS_MOV: return emulateMov(isn);
+		case X86_INS_MOVZX: return emulateMovZX(isn);
 		case X86_INS_PUSH: return emulatePush(isn);
 		case X86_INS_LEA: return emulateLea(isn);
 		case X86_INS_ADD: return emulateAdd(isn);
 		case X86_INS_SUB: return emulateSub(isn);
+		case X86_INS_INC: return emulateInc(isn);
+		case X86_INS_IMUL: return emulateIMul(isn);
 		case X86_INS_XOR: return emulateXor(isn);
+		case X86_INS_OR: return emulateOr(isn);
 		case X86_INS_BTC: return emulateBtc(isn);
 
 		case X86_INS_CMP:
@@ -560,6 +568,15 @@ private:
 		derefStore(dest, isn.ops[0].size, isn.rva, value);
 	}
 
+	void emulateMovZX(const Instruction& isn)
+	{
+		assert(isn.opcount == 2);
+		assert(isn.ops[0].size > isn.ops[1].size);
+		auto dest = operandAddress(isn, isn.ops[0]);
+		auto value = read(isn, isn.ops[1]);
+		derefStore(dest, isn.ops[0].size, isn.rva, simplifyZeroExtend(isn.rva, isn.ops[0].size, value, isn.ops[1].size));
+	}
+
 	void emulateAdd(const Instruction& isn)
 	{
 		// TODO: add x, x ==> x *= 2 ??? or this should be handled by simplifier?
@@ -591,6 +608,15 @@ private:
 		}
 	}
 
+	void emulateIMul(const Instruction& isn)
+	{
+		ensure(isn.opcount == 3); // TODO: 1-operand and 2-operand forms
+		assert(isn.ops[0].size == isn.ops[1].size && isn.ops[0].size == isn.ops[2].size);
+		auto dest = operandAddress(isn, isn.ops[0]);
+		auto modified = simplifyMul(isn.rva, isn.ops[0].size, read(isn, isn.ops[1]), read(isn, isn.ops[2]));
+		derefStore(dest, isn.ops[0].size, isn.rva, modified);
+	}
+
 	void emulateXor(const Instruction& isn)
 	{
 		assert(isn.opcount == 2);
@@ -610,6 +636,16 @@ private:
 		}
 	}
 
+	void emulateOr(const Instruction& isn)
+	{
+		assert(isn.opcount == 2);
+		assert(isn.ops[0].size == isn.ops[1].size);
+		auto dest = operandAddress(isn, isn.ops[0]);
+		auto value = read(isn, isn.ops[1]);
+		auto modified = simplifyOr(isn.rva, isn.ops[0].size, derefLoad(dest, isn.ops[0].size, isn.rva), value);
+		derefStore(dest, isn.ops[0].size, isn.rva, modified);
+	}
+
 	void emulatePush(const Instruction& isn)
 	{
 		assert(isn.opcount == 1 && isn.ops[0].size == 8);
@@ -620,6 +656,14 @@ private:
 		rspValue.value.ptr -= 8;
 		derefStore(rsp, 8, isn.rva, rspValue);
 		derefStore(rspValue, isn.ops[0].size, isn.rva, read(isn, isn.ops[0]));
+	}
+
+	void emulateInc(const Instruction& isn)
+	{
+		assert(isn.opcount == 1);
+		auto dest = operandAddress(isn, isn.ops[0]);
+		auto modified = simplifyAdd(isn.rva, isn.ops[0].size, derefLoad(dest, isn.ops[0].size, isn.rva), 1);
+		derefStore(dest, isn.ops[0].size, isn.rva, modified);
 	}
 
 	void emulateBtc(const Instruction& isn)
@@ -633,6 +677,13 @@ private:
 		derefStore(dest, isn.ops[0].size, isn.rva, modified);
 	}
 
+	AnalysisPointer regToPtr(x86_reg reg, int expectedSize)
+	{
+		auto [offset, size] = AnalysisState::registerToOffsetSize(reg);
+		ensure(size == expectedSize);
+		return AnalysisPointer{ AnalysisState::AS_Register, offset };
+	}
+
 	// think what 'lea' does, but also supports registers - convert reg/mem operand to an 'address'
 	// note that it might return any type (e.g. constant if operand is [addr], or an expression ref if operand is something like [rcx] where rcx value is unknown
 	// registers are converted to pointers into 'register file' address space
@@ -640,29 +691,20 @@ private:
 	{
 		if (operand.type == OperandType::Reg)
 		{
-			auto [offset, size] = AnalysisState::registerToOffsetSize(operand.reg);
-			assert(size == operand.size);
-			return AnalysisPointer{ AnalysisState::AS_Register, offset };
+			return regToPtr(operand.reg, operand.size);
 		}
 		else
 		{
 			assert(operand.type == OperandType::Mem || operand.type == OperandType::MemRVA);
 			auto res = operandAddressBase(isn, operand.type == OperandType::MemRVA);
-			auto off = operandAddressOffset(isn);
-			switch (res.type)
+			res = simplifyAdd(isn.rva, 8, res, isn.mem.disp);
+			if (isn.mem.index != X86_REG_INVALID && isn.mem.scale != 0)
 			{
-			case AnalysisValueType::Constant:
-				res.value.constant += off;
-				return res;
-			case AnalysisValueType::Pointer:
-				res.value.ptr.offset += off;
-				return res;
-			case AnalysisValueType::Expression:
-				return simplifyAdd(isn.rva, 8, res, off);
-			default:
-				__debugbreak();
-				return{};
+				ensure(isn.mem.scale == 1); // TODO: implement...
+				auto index = derefLoad(regToPtr(isn.mem.index, 8), 8, isn.rva);
+				res = simplifyAdd(isn.rva, 8, res, index);
 			}
+			return res;
 		}
 	}
 
@@ -676,47 +718,18 @@ private:
 		else if (isn.mem.segment == X86_REG_INVALID)
 		{
 			assert(isn.mem.base != X86_REG_INVALID);
-			auto [offset, size] = AnalysisState::registerToOffsetSize(isn.mem.base);
-			assert(size == 8);
-			return derefLoad(AnalysisPointer{ AnalysisState::AS_Register, offset }, size, isn.rva);
+			return derefLoad(regToPtr(isn.mem.base, 8), 8, isn.rva);
 		}
 		else if (isn.mem.segment == X86_REG_GS)
 		{
-			auto offset = 0;
-			if (isn.mem.base != X86_REG_INVALID)
-			{
-				auto [boffset, bsize] = AnalysisState::registerToOffsetSize(isn.mem.base);
-				assert(bsize == 8);
-				auto bval = derefLoad(AnalysisPointer{ AnalysisState::AS_Register, boffset }, bsize, isn.rva);
-				if (bval.type == AnalysisValueType::Constant)
-					offset += bval.value.constant;
-				else
-					__debugbreak();
-			}
-			return AnalysisPointer{ AnalysisState::AS_TEB, offset };
+			AnalysisValueWithType base = isn.mem.base != X86_REG_INVALID ? derefLoad(regToPtr(isn.mem.base, 8), 8, isn.rva) : 0;
+			return simplifyAdd(isn.rva, 8, AnalysisPointer{ AnalysisState::AS_TEB }, base);
 		}
 		else
 		{
 			__debugbreak(); // TODO
 			return{};
 		}
-	}
-
-	// TODO: should it return AVWT instead?..
-	i32 operandAddressOffset(const Instruction& isn)
-	{
-		auto offset = isn.mem.disp;
-		if (isn.mem.index != X86_REG_INVALID && isn.mem.scale != 0)
-		{
-			auto [ioffset, isize] = AnalysisState::registerToOffsetSize(isn.mem.index);
-			assert(isize == 8);
-			auto ival = derefLoad(AnalysisPointer{ AnalysisState::AS_Register, ioffset }, isize, isn.rva);
-			if (ival.type == AnalysisValueType::Constant)
-				offset += ival.value.constant;
-			else
-				__debugbreak();
-		}
-		return offset;
 	}
 
 	// load value stored at specified address
@@ -765,16 +778,22 @@ private:
 			__debugbreak();
 			return addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address));
 		}
-		else if (prev->value.type != AnalysisValueType::Constant)
+		else if (prev->value.type == AnalysisValueType::Constant)
+		{
+			// partial read of constant
+			auto value = prev->value.value.constant & ((1ull << 8 * size) - 1);
+			return makeConstant(value, size);
+		}
+		else if (prev->value.type == AnalysisValueType::Expression && mExpressions[prev->value.value.expr.index].size == size)
+		{
+			// TODO: reconsider (this deals with mov eax, expr - that was zero-extended to rax etc)
+			return prev->value;
+		}
+		else
 		{
 			// TODO: partial read of non-constant - what to do?.. can have something like & 0xFFFF....
 			__debugbreak();
 			return addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address));
-		}
-		else
-		{
-			auto value = prev->value.value.constant & ((1ull << 8 * size) - 1);
-			return makeConstant(value, size);
 		}
 	}
 
@@ -783,7 +802,7 @@ private:
 	{
 		assert(value.type != AnalysisValueType::Unknown);
 		ensure(value.type != AnalysisValueType::Pointer || size == 8); // chopping pointers is probably not correct?..
-		ensure(value.type != AnalysisValueType::Expression || mExpressions[value.value.expr.index].size == size); // ???
+		ensure(value.type != AnalysisValueType::Expression || mExpressions[value.value.expr.index].size == size);
 
 		if (address.type != AnalysisValueType::Pointer)
 		{
@@ -943,97 +962,173 @@ private:
 		return addExpression(rva, { size, AnalysisExpressionOp::Neg, v });
 	}
 
+	AnalysisValueWithType simplifyZeroExtend(rva_t rva, int size, AnalysisValueWithType v, int originalSize)
+	{
+		assert(size > originalSize);
+		switch (v.type)
+		{
+		case AnalysisValueType::Constant:
+			return v.value.constant & ((1ull << 8 * originalSize) - 1);
+		case AnalysisValueType::Expression:
+			assert(mExpressions[v.value.expr.index].size == originalSize);
+			// TODO: simplify - zero-extend zero-extended
+			return addExpression(rva, { size, AnalysisExpressionOp::ZeroExtend, v });
+		default:
+			throw std::exception("Unexpected value type");
+		}
+	}
+
 	AnalysisValueWithType simplifyAdd(rva_t rva, int size, AnalysisValueWithType lhs, AnalysisValueWithType rhs)
 	{
-		commAssocSwapIfNeeded(lhs, AnalysisExpressionOp::Add, rhs);
-
-		if (lhs.type == AnalysisValueType::Constant)
-		{
-			assert(rhs.type == AnalysisValueType::Constant); // otherwise we'd have swapped
-			return makeConstant(lhs.value.constant + rhs.value.constant, size);
-		}
-
-		if (lhs.type == AnalysisValueType::Pointer && rhs.type == AnalysisValueType::Constant)
-		{
-			return lhs.value.ptr + rhs.value.constant;
-		}
-
-		if (rhs.type == AnalysisValueType::Expression && mExpressions[rhs.value.expr.index].op == AnalysisExpressionOp::Add)
-		{
-			assert(lhs.type == AnalysisValueType::Expression && mExpressions[lhs.value.expr.index].op == AnalysisExpressionOp::Add); // otherwise we'd have swapped
-			// (a + b) + (c + d) ==> ((a + b) + c) + d
-			auto& r = mExpressions[rhs.value.expr.index];
-			lhs = simplifyAdd(rva, size, lhs, r.getOperand(0));
-			rhs = r.getOperand(1);
-		}
-
-		if (lhs.type == AnalysisValueType::Expression && mExpressions[lhs.value.expr.index].op == AnalysisExpressionOp::Add)
-		{
-			auto& l = mExpressions[lhs.value.expr.index];
-			assert(l.operandType[1] != AnalysisValueType::Expression || mExpressions[l.operandValue[1].expr.index].op != AnalysisExpressionOp::Add); // this would violate associativity form
-			if (rhs.type == AnalysisValueType::Constant && (l.operandType[1] == AnalysisValueType::Constant || l.operandType[1] == AnalysisValueType::Pointer))
+		// TODO: a * b + c * b ==> (a + c) * b ?
+		return simplifyBinaryCommAssoc(rva, size, lhs, AnalysisExpressionOp::Add, rhs, [this](rva_t rva, int size, AnalysisValueWithType lhs, AnalysisValueWithType rhs) -> AnalysisValueWithType {
+			if (lhs.type == AnalysisValueType::Constant)
 			{
-				// (x + ptr/c1) + c2 ==> x + (ptr/c1 + c2)
-				rhs = simplifyAdd(rva, size, l.getOperand(1), rhs);
-				assert(rhs.type == AnalysisValueType::Constant || rhs.type == AnalysisValueType::Pointer);
-				lhs = l.getOperand(0);
-				assert(lhs.type == AnalysisValueType::Pointer || lhs.type == AnalysisValueType::Expression);
+				assert(rhs.type == AnalysisValueType::Constant); // otherwise we'd have swapped
+				return makeConstant(lhs.value.constant + rhs.value.constant, size);
 			}
-			else if (priorityForCommAssoc(l.getOperand(1), AnalysisExpressionOp::Add) < priorityForCommAssoc(rhs, AnalysisExpressionOp::Add))
-			{
-				// something like (x + const) + expr ==> (x + expr) + const
-				lhs = simplifyAdd(rva, size, l.getOperand(0), rhs);
-				rhs = l.getOperand(1);
-			}
-		}
 
-		// TODO: ((a + b) + c) + (-a) ==> b + c
-		// TODO: ptr(ASx) + neg(ptr(ASx)) ==> constant
-		// TODO: a * b + c * b ==> (a + c) * b
-		return addExpression(rva, { size, lhs, AnalysisExpressionOp::Add, rhs });
+			if (rhs.type == AnalysisValueType::Constant && rhs.value.constant == 0)
+				return lhs; // no-op
+
+			if (lhs.type == AnalysisValueType::Pointer && rhs.type == AnalysisValueType::Constant)
+				return lhs.value.ptr + rhs.value.constant;
+
+			// TODO: ptr(ASx) + neg(ptr(ASx)) ==> constant
+			if (matchUnaryExpr(lhs, AnalysisExpressionOp::Neg, rhs) || matchUnaryExpr(rhs, AnalysisExpressionOp::Neg, lhs))
+				return 0; // (-x) + x ==> 0
+			if (matchUnaryExpr(lhs, AnalysisExpressionOp::Not, rhs) || matchUnaryExpr(rhs, AnalysisExpressionOp::Not, lhs))
+				return -1; // (~x) + x ==> -1
+
+			return{};
+		});
+	}
+
+	AnalysisValueWithType simplifyMul(rva_t rva, int size, AnalysisValueWithType lhs, AnalysisValueWithType rhs)
+	{
+		// TODO: interop with add - eg something like c1 * x + c2 * x ==> (c1 + c2) * x
+		return simplifyBinaryCommAssoc(rva, size, lhs, AnalysisExpressionOp::MulLo, rhs, [this](rva_t rva, int size, AnalysisValueWithType lhs, AnalysisValueWithType rhs) -> AnalysisValueWithType {
+			if (lhs.type == AnalysisValueType::Constant)
+			{
+				assert(rhs.type == AnalysisValueType::Constant); // otherwise we'd have swapped
+				return makeConstant(lhs.value.constant * rhs.value.constant, size);
+			}
+
+			if (rhs.type == AnalysisValueType::Constant && rhs.value.constant == 0)
+				return 0;
+			if (rhs.type == AnalysisValueType::Constant && rhs.value.constant == 1)
+				return lhs; // no-op
+			// TODO: x * (-1) ==> neg(x) ?
+
+			return{};
+		});
 	}
 
 	AnalysisValueWithType simplifyXor(rva_t rva, int size, AnalysisValueWithType lhs, AnalysisValueWithType rhs)
 	{
-		commAssocSwapIfNeeded(lhs, AnalysisExpressionOp::Xor, rhs);
-
-		if (lhs.type == AnalysisValueType::Constant)
-		{
-			assert(rhs.type == AnalysisValueType::Constant); // otherwise we'd have swapped
-			return makeConstant(lhs.value.constant ^ rhs.value.constant, size);
-		}
-
-		if (rhs.type == AnalysisValueType::Expression && mExpressions[rhs.value.expr.index].op == AnalysisExpressionOp::Xor)
-		{
-			assert(lhs.type == AnalysisValueType::Expression && mExpressions[lhs.value.expr.index].op == AnalysisExpressionOp::Xor); // otherwise we'd have swapped
-			// (a ^ b) ^ (c ^ d) ==> ((a ^ b) ^ c) ^ d
-			auto& r = mExpressions[rhs.value.expr.index];
-			lhs = simplifyXor(rva, size, lhs, r.getOperand(0));
-			rhs = r.getOperand(1);
-		}
-
-		if (lhs.type == AnalysisValueType::Expression && mExpressions[lhs.value.expr.index].op == AnalysisExpressionOp::Xor)
-		{
-			auto& l = mExpressions[lhs.value.expr.index];
-			assert(l.operandType[1] != AnalysisValueType::Expression || mExpressions[l.operandValue[1].expr.index].op != AnalysisExpressionOp::Xor); // this would violate associativity form
-			if (rhs.type == AnalysisValueType::Constant && l.operandType[1] == AnalysisValueType::Constant)
+		return simplifyBinaryCommAssoc(rva, size, lhs, AnalysisExpressionOp::Xor, rhs, [this](rva_t rva, int size, AnalysisValueWithType lhs, AnalysisValueWithType rhs) -> AnalysisValueWithType {
+			if (lhs.type == AnalysisValueType::Constant)
 			{
-				// (x ^ c1) ^ c2 ==> x ^ (c1 ^ c2)
-				rhs = l.operandValue[1].constant ^ rhs.value.constant;
-				assert(rhs.type == AnalysisValueType::Constant);
-				lhs = l.getOperand(0);
-				assert(lhs.type == AnalysisValueType::Pointer || lhs.type == AnalysisValueType::Expression);
+				assert(rhs.type == AnalysisValueType::Constant); // otherwise we'd have swapped
+				return makeConstant(lhs.value.constant ^ rhs.value.constant, size);
 			}
-			else if (priorityForCommAssoc(l.getOperand(1), AnalysisExpressionOp::Xor) < priorityForCommAssoc(rhs, AnalysisExpressionOp::Xor))
+
+			// TODO: x ^ -1 ==> ~x ?
+			if (rhs.type == AnalysisValueType::Constant && rhs.value.constant == 0)
+				return lhs; // no-op
+
+			if (lhs == rhs)
+				return 0; // x ^ x ==> 0
+			if (matchUnaryExpr(lhs, AnalysisExpressionOp::Not, rhs) || matchUnaryExpr(rhs, AnalysisExpressionOp::Not, lhs))
+				return -1; // (~x) ^ x ==> -1
+
+			return{};
+		});
+	}
+
+	AnalysisValueWithType simplifyOr(rva_t rva, int size, AnalysisValueWithType lhs, AnalysisValueWithType rhs)
+	{
+		return simplifyBinaryCommAssoc(rva, size, lhs, AnalysisExpressionOp::Or, rhs, [this](rva_t rva, int size, AnalysisValueWithType lhs, AnalysisValueWithType rhs) -> AnalysisValueWithType {
+			if (lhs.type == AnalysisValueType::Constant)
 			{
-				// something like (x ^ const) ^ expr ==> (x ^ expr) ^ const
-				lhs = simplifyXor(rva, size, l.getOperand(0), rhs);
-				rhs = l.getOperand(1);
+				assert(rhs.type == AnalysisValueType::Constant); // otherwise we'd have swapped
+				return makeConstant(lhs.value.constant | rhs.value.constant, size);
 			}
+
+			if (rhs.type == AnalysisValueType::Constant && rhs.value.constant == 0)
+				return lhs; // no-op
+			if (rhs.type == AnalysisValueType::Constant && rhs.value.constant == -1)
+				return -1;
+
+			if (lhs == rhs)
+				return lhs; // x | x ==> x
+			if (matchUnaryExpr(lhs, AnalysisExpressionOp::Not, rhs) || matchUnaryExpr(rhs, AnalysisExpressionOp::Not, lhs))
+				return -1; // (~x) | x ==> -1
+
+			return{};
+		});
+	}
+
+	// note: FnSimplify should not create new expressions - these might get discarded
+	template<typename FnSimplify>
+	AnalysisValueWithType simplifyBinaryCommAssoc(rva_t rva, int size, AnalysisValueWithType lhs, AnalysisExpressionOp op, AnalysisValueWithType rhs, FnSimplify&& simplify)
+	{
+		commAssocSwapIfNeeded(lhs, op, rhs);
+
+		if (auto r = exprWithOp(rhs, op))
+		{
+			assert(r->size == size);
+			assert(exprWithOp(lhs, op)); // otherwise we'd have swapped
+			// (a op b) op (c op d) ==> ((a op b) op c) op d
+			// TODO: do we really want to do that?.. this introduces tons of new expressions at same rva... maybe leave as is, unless some pair is special-case-simplifiable?..
+			auto inner = simplifyBinaryCommAssoc(rva, size, lhs, op, r->getOperand(0), std::forward<FnSimplify>(simplify));
+			return simplifyBinaryCommAssoc(rva, size, inner, op, r->getOperand(1), std::forward<FnSimplify>(simplify));
 		}
 
-		// TODO: ((a ^ b) ^ c) ^ a ==> b ^ c
-		return addExpression(rva, { size, lhs, AnalysisExpressionOp::Xor, rhs });
+		if (auto simplified = simplifyBinaryCommAssocRecurse(rva, size, lhs, op, rhs, std::forward<FnSimplify>(simplify)); simplified.type != AnalysisValueType::Unknown)
+			return simplified;
+
+		// nope, we can't simplify anything - just create a new binary expression
+		// we might need to swap operands around for nested expression to maintain ordering
+		if (auto l = exprWithOp(lhs, op); l && priorityForCommAssoc(l->getOperand(1), op) < priorityForCommAssoc(rhs, op))
+		{
+			// something like (x + const) + expr ==> (x + expr) + const
+			auto inner = simplifyBinaryCommAssoc(rva, size, l->getOperand(0), op, rhs, std::forward<FnSimplify>(simplify));
+			return simplifyBinaryCommAssoc(rva, size, inner, op, l->getOperand(1), std::forward<FnSimplify>(simplify));
+		}
+
+		return addExpression(rva, { size, lhs, op, rhs });
+	}
+
+	template<typename FnSimplify>
+	AnalysisValueWithType simplifyBinaryCommAssocRecurse(rva_t rva, int size, AnalysisValueWithType lhs, AnalysisExpressionOp op, AnalysisValueWithType rhs, FnSimplify&& simplify)
+	{
+		assert(!exprWithOp(rhs, op)); // this should be handled by the caller
+
+		// try direct simplification first
+		if (auto res = simplify(rva, size, lhs, rhs); rhs.type != AnalysisValueType::Unknown)
+			return res;
+
+		// see if lhs is nested op
+		if (auto l = exprWithOp(lhs, op))
+		{
+			// (a op b) op c
+			assert(l->size == size);
+			auto a = l->getOperand(0);
+			auto b = l->getOperand(1);
+			assert(!exprWithOp(b, op)); // this would violate associativity form
+
+			// first check whether (b op c) is simplifiable - and if so, replace with a op (b op c)
+			if (auto bc = simplify(rva, size, b, rhs); bc.type != AnalysisValueType::Unknown)
+				return simplifyBinaryCommAssoc(rva, size, a, op, bc, std::forward<FnSimplify>(simplify));
+
+			// and now check (a op c) - this has to be done recursively, since a might be a nested op
+			if (auto ac = simplifyBinaryCommAssocRecurse(rva, size, a, op, rhs, std::forward<FnSimplify>(simplify)); ac.type != AnalysisValueType::Unknown)
+				return simplifyBinaryCommAssoc(rva, size, ac, op, b, std::forward<FnSimplify>(simplify));
+		}
+
+		// nope, can't simplify - return nothing to let caller try again
+		return{};
 	}
 
 	// associativeness: nested is always on the left
@@ -1053,6 +1148,22 @@ private:
 	{
 		if (priorityForCommAssoc(lhs, op) < priorityForCommAssoc(rhs, op))
 			std::swap(rhs, lhs);
+	}
+
+	// return expression referred to by the value, if it has specified op, or null otherwise
+	AnalysisExpression* exprWithOp(AnalysisValueWithType v, AnalysisExpressionOp op)
+	{
+		if (v.type != AnalysisValueType::Expression)
+			return nullptr;
+		auto& expr = mExpressions[v.value.expr.index];
+		return expr.op == op ? &expr : nullptr;
+	}
+
+	// check whether given value is an unary expression with specified argument
+	bool matchUnaryExpr(AnalysisValueWithType v, AnalysisExpressionOp op, AnalysisValueWithType arg)
+	{
+		auto expr = exprWithOp(v, op);
+		return expr && expr->getOperand(0) == arg;
 	}
 
 private:

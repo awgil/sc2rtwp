@@ -49,7 +49,7 @@
     <DisplayString Condition="opcount == 2 &amp;&amp; ops[0].type == OperandType::Reg &amp;&amp; ops[1].type == OperandType::MemRVA">{rva,x}: {mnem,en} {ops[0].reg,en}, {mem,view(rva)} </DisplayString>
     <DisplayString Condition="opcount == 2 &amp;&amp; ops[0].type == OperandType::Mem &amp;&amp; ops[1].type == OperandType::Imm">{rva,x}: {mnem,en} {mem}, {imm} </DisplayString>
     <DisplayString Condition="opcount == 2 &amp;&amp; ops[0].type == OperandType::MemRVA &amp;&amp; ops[1].type == OperandType::Imm">{rva,x}: {mnem,en} {mem,view(rva)}, {imm} </DisplayString>
-    <DisplayString Condition="opcount == 3 &amp;&amp; ops[0].type == OperandType::Reg &amp;&amp; ops[1].type == OperandType::Reg &amp;&amp; ops[2].type == OperandType::Imm">{rva,x}: {mnem,en} {ops[0].reg,en} {ops[1].reg,en} {imm}</DisplayString>
+    <DisplayString Condition="opcount == 3 &amp;&amp; ops[0].type == OperandType::Reg &amp;&amp; ops[1].type == OperandType::Reg &amp;&amp; ops[2].type == OperandType::Imm">{rva,x}: {mnem,en} {ops[0].reg,en}, {ops[1].reg,en}, {imm}</DisplayString>
     <DisplayString Condition="opcount == 1">{rva,x}: {mnem,en} {ops[0].type,en}</DisplayString>
     <DisplayString Condition="opcount == 2">{rva,x}: {mnem,en} {ops[0].type,en} {ops[1].type,en}</DisplayString>
     <DisplayString Condition="opcount == 3">{rva,x}: {mnem,en} {ops[0].type,en} {ops[1].type,en} {ops[2].type,en}</DisplayString>
