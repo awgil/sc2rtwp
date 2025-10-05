@@ -160,7 +160,7 @@ private:
 	void processBootstrapStart()
 	{
 		auto& start = mFuncs.process(mBinary.entryPoint(), "bootstrapStart");
-		auto ana = AnalyzedFunction{ start };
+		auto ana = AnalyzedFunction{ mBinary, start, true };
 
 		matchDataFieldRefs(start, &BootstrapStartState::stage);
 		matchTextReferences(start);

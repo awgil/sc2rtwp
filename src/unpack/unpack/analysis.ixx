@@ -68,6 +68,32 @@ struct AnalysisValueWithType
 };
 bool operator==(const AnalysisValueWithType& l, const AnalysisValueWithType& r) { return l.type == r.type && l.value.constant == r.value.constant; }
 
+template<> struct std::formatter<AnalysisValueWithType>
+{
+	constexpr auto parse(format_parse_context& ctx)
+	{
+		return ctx.begin();
+	}
+
+	auto format(const AnalysisValueWithType& obj, format_context& ctx) const
+	{
+		switch (obj.type)
+		{
+		case AnalysisValueType::Constant:
+			return format_to(ctx.out(), "0x{:X}", (u64)obj.value.constant);
+		case AnalysisValueType::Pointer:
+			if (obj.value.ptr.offset >= 0)
+				return format_to(ctx.out(), "[AS_{} + 0x{:X}]", obj.value.ptr.addressSpace, obj.value.ptr.offset);
+			else
+				return format_to(ctx.out(), "[AS_{} - 0x{:X}]", obj.value.ptr.addressSpace, -obj.value.ptr.offset);
+		case AnalysisValueType::Expression:
+			return format_to(ctx.out(), "${}", obj.value.expr.index);
+		default:
+			return format_to(ctx.out(), "???");
+		}
+	}
+};
+
 enum class AnalysisExpressionOp : u8
 {
 	Invalid,
@@ -76,7 +102,9 @@ enum class AnalysisExpressionOp : u8
 	Deref, // = *op1
 	Neg, // = -op1
 	Not, // = ~op1
+	SignExtend, // = sign-extended op1
 	ZeroExtend, // = zero-extended op1
+	Call, // = op1(...)
 	LastUnary,
 
 	// binary expressions
@@ -115,6 +143,32 @@ struct AnalysisExpression
 	{
 		operandType[index] = value.type;
 		operandValue[index] = value.value;
+	}
+};
+
+template<> struct std::formatter<AnalysisExpression>
+{
+	constexpr auto parse(format_parse_context& ctx)
+	{
+		return ctx.begin();
+	}
+
+	auto format(const AnalysisExpression& obj, format_context& ctx) const
+	{
+		switch (obj.op)
+		{
+		case AnalysisExpressionOp::Deref: return format_to(ctx.out(), "*{}", obj.getOperand(0));
+		case AnalysisExpressionOp::Neg: return format_to(ctx.out(), "-{}", obj.getOperand(0));
+		case AnalysisExpressionOp::Not: return format_to(ctx.out(), "~{}", obj.getOperand(0));
+		case AnalysisExpressionOp::SignExtend: return format_to(ctx.out(), "sx {}", obj.getOperand(0));
+		case AnalysisExpressionOp::ZeroExtend: return format_to(ctx.out(), "zx {}", obj.getOperand(0));
+		case AnalysisExpressionOp::Call: return format_to(ctx.out(), "{}(...)", obj.getOperand(0));
+		case AnalysisExpressionOp::Add: return format_to(ctx.out(), "{} + {}", obj.getOperand(0), obj.getOperand(1));
+		case AnalysisExpressionOp::MulLo: return format_to(ctx.out(), "{} * {}", obj.getOperand(0), obj.getOperand(1));
+		case AnalysisExpressionOp::Xor: return format_to(ctx.out(), "{} ^ {}", obj.getOperand(0), obj.getOperand(1));
+		case AnalysisExpressionOp::Or: return format_to(ctx.out(), "{} | {}", obj.getOperand(0), obj.getOperand(1));
+		default: return format_to(ctx.out(), "??? {}", (int)obj.op);
+		}
 	}
 };
 
@@ -346,12 +400,47 @@ struct AnalysisState
 		auto [begin, size] = registerToOffsetSize(reg);
 		return{ begin, begin + size };
 	}
+
+	void merge(const AnalysisState& other)
+	{
+		// TODO: consider adding some phi expressions? not sure how useful that would be...
+		assert(addressSpaces.size() == other.addressSpaces.size());
+		for (int i = 0; i < addressSpaces.size(); ++i)
+		{
+			auto& dest = addressSpaces[i];
+			auto& src = other.addressSpaces[i];
+			auto iDest = dest.begin();
+			auto iSrc = src.begin();
+			while (iDest != dest.end())
+			{
+				while (iSrc != src.end() && iSrc->begin < iDest->begin)
+					++iSrc; // skip any entries that don't exist in merge destination
+				if (iSrc == src.end())
+					break; // no more entries to merge, anything left in destination is to be removed
+
+				if (iDest->begin == iSrc->begin && iDest->end == iSrc->end && iDest->value == iSrc->value)
+				{
+					// matching value, keep as is
+					++iDest;
+					++iSrc;
+					continue;
+				}
+
+				// some mismatch, remove everything up to the end of merged-in entry
+				auto mismatchEnd = iDest;
+				while (mismatchEnd != dest.end() && mismatchEnd->begin < iSrc->end)
+					++mismatchEnd;
+				iDest = dest.erase(iDest, mismatchEnd); // TODO: we can do better i guess...
+			}
+			dest.erase(iDest, dest.end()); // remove the rest
+		}
+	}
 };
 
 export class AnalyzedFunction
 {
 public:
-	AnalyzedFunction(const FunctionInfo& func)
+	AnalyzedFunction(const PEBinary& bin, const FunctionInfo& func, bool log = false) : mBin(bin), mLog(log)
 	{
 		// first build a 1:1 mapping of raw function blocks to basic blocks
 		std::vector<int> mapping(func.blocks().size());
@@ -476,7 +565,7 @@ private:
 		{
 			if (i >= iBlock)
 				continue; // loop link
-			ensure(false); // TODO: merge...
+			state.merge(mExitStates[i]);
 		}
 		return state;
 	}
@@ -486,27 +575,29 @@ private:
 		// initial setup
 		mExitStates.resize(mBlocks.size());
 
-		mExitStates[0] = std::move(initialState);
-		emulateBlock(0);
+		emulateBlock(0, std::move(initialState));
 		for (int i = 1; i < mBlocks.size(); ++i)
 		{
-			mExitStates[i] = buildEntryState(i);
-			emulateBlock(i);
+			emulateBlock(i, buildEntryState(i));
 		}
 	}
 
-	void emulateBlock(int iBlock)
+	void emulateBlock(int iBlock, AnalysisState&& initialState)
 	{
+		log("> block #{}: 0x{:X}-0x{:X}, predecessors={}", iBlock, mBlocks[iBlock].fblock->begin, mBlocks[iBlock].fblock->end, mBlocks[iBlock].predecessors);
 		mCurrentBlockIndex = iBlock;
+		mExitStates[iBlock] = std::move(initialState);
 		for (auto& isn : mBlocks[iBlock].fblock->instructions)
 			emulateInstruction(isn);
 	}
 
 	void emulateInstruction(const Instruction& isn)
 	{
+		log(">> 0x{:X}: {}", isn.rva, InstructionPrinter(mBin, isn));
 		switch (isn.mnem)
 		{
 		case X86_INS_MOV: return emulateMov(isn);
+		case X86_INS_MOVSXD: return emulateMovSX(isn);
 		case X86_INS_MOVZX: return emulateMovZX(isn);
 		case X86_INS_PUSH: return emulatePush(isn);
 		case X86_INS_LEA: return emulateLea(isn);
@@ -522,27 +613,26 @@ private:
 		case X86_INS_TEST:
 			return; // no-op, unless we start caring about flags
 
-		case X86_INS_JO:
-		case X86_INS_JNO:
-		case X86_INS_JS:
-		case X86_INS_JNS:
-		case X86_INS_JE:
-		case X86_INS_JNE:
-		case X86_INS_JB:
-		case X86_INS_JAE:
-		case X86_INS_JP:
-		case X86_INS_JNP:
-		case X86_INS_JBE:
-		case X86_INS_JA:
-		case X86_INS_JL:
-		case X86_INS_JGE:
-		case X86_INS_JLE:
-		case X86_INS_JG:
+		case X86_INS_JO: case X86_INS_JNO:
+		case X86_INS_JS: case X86_INS_JNS:
+		case X86_INS_JE: case X86_INS_JNE:
+		case X86_INS_JB: case X86_INS_JAE:
+		case X86_INS_JP: case X86_INS_JNP:
+		case X86_INS_JBE: case X86_INS_JA:
+		case X86_INS_JL: case X86_INS_JGE:
+		case X86_INS_JLE: case X86_INS_JG:
 			return; // conditional jumps...
+
+		case X86_INS_CALL: return emulateCall(isn);
+		case X86_INS_INT: return emulateInt(isn);
 
 		case X86_INS_NOP:
 		case X86_INS_JMP:
 			break;
+
+		case X86_INS_MOVUPS: return emulateMov(isn); // TODO: treat as 4 floats instead?..
+		case X86_INS_MOVSD: return emulateMovSD(isn);
+
 		default:
 			__debugbreak();
 		}
@@ -568,6 +658,15 @@ private:
 		derefStore(dest, isn.ops[0].size, isn.rva, value);
 	}
 
+	void emulateMovSX(const Instruction& isn)
+	{
+		assert(isn.opcount == 2);
+		assert(isn.ops[0].size > isn.ops[1].size);
+		auto dest = operandAddress(isn, isn.ops[0]);
+		auto value = read(isn, isn.ops[1]);
+		derefStore(dest, isn.ops[0].size, isn.rva, simplifySignExtend(isn.rva, isn.ops[0].size, value, isn.ops[1].size));
+	}
+
 	void emulateMovZX(const Instruction& isn)
 	{
 		assert(isn.opcount == 2);
@@ -575,6 +674,37 @@ private:
 		auto dest = operandAddress(isn, isn.ops[0]);
 		auto value = read(isn, isn.ops[1]);
 		derefStore(dest, isn.ops[0].size, isn.rva, simplifyZeroExtend(isn.rva, isn.ops[0].size, value, isn.ops[1].size));
+	}
+
+	void emulateMovSD(const Instruction& isn)
+	{
+		assert(isn.opcount == 2);
+		if (isn.ops[0].type != OperandType::Reg)
+		{
+			// movsd mem, reg
+			assert(isn.ops[0].type == OperandType::Mem || isn.ops[0].type == OperandType::MemRVA);
+			assert(isn.ops[1].type == OperandType::Reg);
+			assert(isn.ops[0].size == 8 && isn.ops[1].size == 16);
+		}
+		else if (isn.ops[1].type != OperandType::Reg)
+		{
+			// movsd reg, mem - zeroes out bits 64-127
+			assert(isn.ops[0].type == OperandType::Reg);
+			assert(isn.ops[1].type == OperandType::Mem || isn.ops[1].type == OperandType::MemRVA);
+			assert(isn.ops[0].size == 16 && isn.ops[1].size == 8);
+		}
+		else
+		{
+			// movsd reg, reg - keeps bits 64+ untouched
+			assert(isn.ops[0].type == OperandType::Reg);
+			assert(isn.ops[1].type == OperandType::Reg);
+			assert(isn.ops[0].size == 16 && isn.ops[1].size == 16);
+		}
+		auto dest = operandAddress(isn, isn.ops[0]);
+		auto value = derefLoad(operandAddress(isn, isn.ops[1]), 8, isn.rva);
+		derefStore(dest, 8, isn.rva, value);
+		if (isn.ops[1].type != OperandType::Reg)
+			derefStore(dest.value.ptr + 8, 8, isn.rva, 0);
 	}
 
 	void emulateAdd(const Instruction& isn)
@@ -677,6 +807,34 @@ private:
 		derefStore(dest, isn.ops[0].size, isn.rva, modified);
 	}
 
+	void emulateCall(const Instruction& isn)
+	{
+		assert(isn.opcount == 1);
+		auto callee = read(isn, isn.ops[0]);
+		// TODO: not sure what we want to do with arguments here...
+		auto& state = mExitStates[mCurrentBlockIndex];
+		auto a1 = state.addressSpaces[AnalysisState::AS_Register].find(AnalysisState::registerToOffsetSize(X86_REG_RCX).first);
+		auto a2 = state.addressSpaces[AnalysisState::AS_Register].find(AnalysisState::registerToOffsetSize(X86_REG_RDX).first);
+		auto a3 = state.addressSpaces[AnalysisState::AS_Register].find(AnalysisState::registerToOffsetSize(X86_REG_R8).first);
+		auto a4 = state.addressSpaces[AnalysisState::AS_Register].find(AnalysisState::registerToOffsetSize(X86_REG_R9).first);
+		auto argsRest = derefLoad(AnalysisPointer{ AnalysisState::AS_Register, AnalysisState::registerToOffsetSize(X86_REG_RSP).first }, 8, isn.rva);
+		assert(argsRest.type == AnalysisValueType::Pointer && argsRest.value.ptr.addressSpace == AnalysisState::AS_Stack);
+		argsRest.value.ptr += 0x20;
+		// clear all volatile registers
+		// TODO: clear part of stack too? does it even matter?
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(AnalysisState::registerToOffsetSize(X86_REG_RAX).first, AnalysisState::registerToRange(X86_REG_RDX).second); // rax/rcx/rdx are contiguous
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(AnalysisState::registerToOffsetSize(X86_REG_R8).first, AnalysisState::registerToRange(X86_REG_R10).second); // r8/r9/r10 are contiguous
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(AnalysisState::registerToOffsetSize(X86_REG_ZMM0).first, AnalysisState::registerToRange(X86_REG_ZMM5).second); // xmm0-xmm5 are volatile; TODO: upper portions of xmm6-15 are too...
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(AnalysisState::registerToOffsetSize(X86_REG_ZMM16).first, AnalysisState::registerToRange(X86_REG_ZMM31).second);
+		derefStore(regToPtr(X86_REG_RAX, 8), 8, isn.rva, addExpression(isn.rva, AnalysisExpression(8, AnalysisExpressionOp::Call, callee)));
+	}
+
+	void emulateInt(const Instruction& isn)
+	{
+		assert(isn.opcount == 1 && isn.ops[0].type == OperandType::Imm);
+		ensure(isn.imm == 0x29); // fastfail
+	}
+
 	AnalysisPointer regToPtr(x86_reg reg, int expectedSize)
 	{
 		auto [offset, size] = AnalysisState::registerToOffsetSize(reg);
@@ -700,9 +858,8 @@ private:
 			res = simplifyAdd(isn.rva, 8, res, isn.mem.disp);
 			if (isn.mem.index != X86_REG_INVALID && isn.mem.scale != 0)
 			{
-				ensure(isn.mem.scale == 1); // TODO: implement...
 				auto index = derefLoad(regToPtr(isn.mem.index, 8), 8, isn.rva);
-				res = simplifyAdd(isn.rva, 8, res, index);
+				res = simplifyAdd(isn.rva, 8, res, simplifyMul(isn.rva, 8, index, isn.mem.scale));
 			}
 			return res;
 		}
@@ -735,6 +892,24 @@ private:
 	// load value stored at specified address
 	AnalysisValueWithType derefLoad(AnalysisValueWithType address, int size, rva_t rva)
 	{
+		auto value = derefLoadNoLog(address, size, rva);
+		log(">>> load {}b {} = {}", size, address, value);
+		if (address.type == AnalysisValueType::Expression)
+			log(">>>> {} == {}", address, mExpressions[address.value.expr.index]);
+		if (value.type == AnalysisValueType::Expression)
+			log(">>>> {} == {}", value, mExpressions[value.value.expr.index]);
+		return value;
+	}
+
+	AnalysisValueWithType derefLoadNoLog(AnalysisValueWithType address, int size, rva_t rva)
+	{
+		if (auto expr = exprWithOp(address, AnalysisExpressionOp::Add); expr && expr->operandType[1] == AnalysisValueType::Pointer)
+		{
+			// address + some unknown offset...
+			__debugbreak();
+			address = expr->getOperand(1);
+		}
+
 		if (address.type != AnalysisValueType::Pointer)
 			return addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address)); // fallback, we don't know how to dereference non-pointer properly
 
@@ -778,28 +953,44 @@ private:
 			__debugbreak();
 			return addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address));
 		}
-		else if (prev->value.type == AnalysisValueType::Constant)
+
+		// at this point we're dealing with partial read
+		if (prev->value.type == AnalysisValueType::Constant)
 		{
 			// partial read of constant
 			auto value = prev->value.value.constant & ((1ull << 8 * size) - 1);
 			return makeConstant(value, size);
 		}
-		else if (prev->value.type == AnalysisValueType::Expression && mExpressions[prev->value.value.expr.index].size == size)
+		else if (prev->value.type == AnalysisValueType::Expression)
 		{
-			// TODO: reconsider (this deals with mov eax, expr - that was zero-extended to rax etc)
-			return prev->value;
+			auto& expr = mExpressions[prev->value.value.expr.index];
+			if (expr.size == size)
+			{
+				// TODO: reconsider (this deals with mov eax, expr - that was zero-extended to rax etc)
+				return prev->value;
+			}
+
+			if ((expr.op == AnalysisExpressionOp::SignExtend || expr.op == AnalysisExpressionOp::ZeroExtend) && expr.operandType[0] == AnalysisValueType::Expression && mExpressions[expr.operandValue[0].expr.index].size == size)
+			{
+				// TODO: reconsider (this deals with movzx eax, word/byte + mov word, ax)
+				return expr.getOperand(0);
+			}
 		}
-		else
-		{
-			// TODO: partial read of non-constant - what to do?.. can have something like & 0xFFFF....
-			__debugbreak();
-			return addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address));
-		}
+
+		// TODO: other partial reads - what to do?.. can have something like & 0xFFFF....
+		__debugbreak();
+		return addExpression(rva, AnalysisExpression(size, AnalysisExpressionOp::Deref, address));
 	}
 
 	// store specified value at specified address
 	void derefStore(AnalysisValueWithType address, int size, rva_t rva, AnalysisValueWithType value)
 	{
+		log(">>> store {}b {} = {}", size, address, value);
+		if (address.type == AnalysisValueType::Expression)
+			log(">>>> {} == {}", address, mExpressions[address.value.expr.index]);
+		if (value.type == AnalysisValueType::Expression)
+			log(">>>> {} == {}", value, mExpressions[value.value.expr.index]);
+
 		assert(value.type != AnalysisValueType::Unknown);
 		ensure(value.type != AnalysisValueType::Pointer || size == 8); // chopping pointers is probably not correct?..
 		ensure(value.type != AnalysisValueType::Expression || mExpressions[value.value.expr.index].size == size);
@@ -891,7 +1082,6 @@ private:
 			else
 			{
 				// just shrink the entry, effectively forgetting high bytes
-				__debugbreak();
 				space.shrink(prev->begin, entryEnd, prev);
 			}
 		}
@@ -899,7 +1089,7 @@ private:
 		if (prev->end < entryEnd)
 		{
 			// existing entry just needs to be extended - this is fine, we'll overwrite it fully
-			space.extend(prev->begin, entryEnd, prev);
+			space.extend(prev->end, entryEnd, prev + 1);
 		}
 
 		// happy path - existing entry covers exactly same region as new one, so just overwrite
@@ -962,6 +1152,22 @@ private:
 		return addExpression(rva, { size, AnalysisExpressionOp::Neg, v });
 	}
 
+	AnalysisValueWithType simplifySignExtend(rva_t rva, int size, AnalysisValueWithType v, int originalSize)
+	{
+		assert(size > originalSize);
+		switch (v.type)
+		{
+		case AnalysisValueType::Constant:
+			return makeConstant(v.value.constant, originalSize);
+		case AnalysisValueType::Expression:
+			assert(mExpressions[v.value.expr.index].size == originalSize);
+			// TODO: simplify - extend extended
+			return addExpression(rva, { size, AnalysisExpressionOp::SignExtend, v });
+		default:
+			throw std::exception("Unexpected value type");
+		}
+	}
+
 	AnalysisValueWithType simplifyZeroExtend(rva_t rva, int size, AnalysisValueWithType v, int originalSize)
 	{
 		assert(size > originalSize);
@@ -971,7 +1177,7 @@ private:
 			return v.value.constant & ((1ull << 8 * originalSize) - 1);
 		case AnalysisValueType::Expression:
 			assert(mExpressions[v.value.expr.index].size == originalSize);
-			// TODO: simplify - zero-extend zero-extended
+			// TODO: simplify - extend extended
 			return addExpression(rva, { size, AnalysisExpressionOp::ZeroExtend, v });
 		default:
 			throw std::exception("Unexpected value type");
@@ -1081,8 +1287,9 @@ private:
 			assert(exprWithOp(lhs, op)); // otherwise we'd have swapped
 			// (a op b) op (c op d) ==> ((a op b) op c) op d
 			// TODO: do we really want to do that?.. this introduces tons of new expressions at same rva... maybe leave as is, unless some pair is special-case-simplifiable?..
+			auto right = r->getOperand(1); // r is invalidated when new expressions are added
 			auto inner = simplifyBinaryCommAssoc(rva, size, lhs, op, r->getOperand(0), std::forward<FnSimplify>(simplify));
-			return simplifyBinaryCommAssoc(rva, size, inner, op, r->getOperand(1), std::forward<FnSimplify>(simplify));
+			return simplifyBinaryCommAssoc(rva, size, inner, op, right, std::forward<FnSimplify>(simplify));
 		}
 
 		if (auto simplified = simplifyBinaryCommAssocRecurse(rva, size, lhs, op, rhs, std::forward<FnSimplify>(simplify)); simplified.type != AnalysisValueType::Unknown)
@@ -1093,8 +1300,9 @@ private:
 		if (auto l = exprWithOp(lhs, op); l && priorityForCommAssoc(l->getOperand(1), op) < priorityForCommAssoc(rhs, op))
 		{
 			// something like (x + const) + expr ==> (x + expr) + const
+			auto right = l->getOperand(1);
 			auto inner = simplifyBinaryCommAssoc(rva, size, l->getOperand(0), op, rhs, std::forward<FnSimplify>(simplify));
-			return simplifyBinaryCommAssoc(rva, size, inner, op, l->getOperand(1), std::forward<FnSimplify>(simplify));
+			return simplifyBinaryCommAssoc(rva, size, inner, op, right, std::forward<FnSimplify>(simplify));
 		}
 
 		return addExpression(rva, { size, lhs, op, rhs });
@@ -1166,9 +1374,17 @@ private:
 		return expr && expr->getOperand(0) == arg;
 	}
 
+	template<typename... Args> void log(const std::format_string<Args...> fmt, Args&&... args)
+	{
+		if (mLog)
+			std::println(fmt, std::forward<Args>(args)...);
+	}
+
 private:
 	std::vector<AnalysisBlock> mBlocks; // sorted in topological (reverse-post) order
 	std::vector<AnalysisState> mExitStates;
 	std::vector<AnalysisExpression> mExpressions;
 	int mCurrentBlockIndex = -1;
+	const PEBinary& mBin;
+	bool mLog = false;
 };

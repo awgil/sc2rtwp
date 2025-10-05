@@ -110,6 +110,15 @@ public:
 	// remove a subrange
 	auto erase(auto begin, auto end) { return mEntries.erase(begin, end); }
 
+	void eraseEntries(const Key& begin, const Key& end)
+	{
+		auto from = findNext(begin);
+		if (auto prev = getPrevIfContains(from, begin); prev != mEntries.end())
+			from = prev;
+		auto to = findNext(end - 1);
+		erase(from, to);
+	}
+
 private:
 	std::vector<Entry> mEntries; // invariant: [i].begin < [i].end <= [i+1].begin
 };

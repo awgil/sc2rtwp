@@ -76,6 +76,9 @@ public:
 		return cs_disasm_iter(mCapstone, &code, &size, &address, mInsn) ? mInsn : nullptr;
 	}
 
+	const char* instructionName(x86_insn isn) const { return cs_insn_name(mCapstone, isn); }
+	const char* registerName(x86_reg reg) const { return cs_reg_name(mCapstone, reg); }
+
 private:
 	csh mCapstone = {};
 	cs_insn* mInsn = nullptr;
@@ -321,6 +324,9 @@ public:
 	{
 		return mDisasm.disasm(reinterpret_cast<const uint8_t*>(mBytes.data() + rva), mBytes.size() - rva, imageBase() + rva);
 	}
+
+	const char* instructionName(x86_insn isn) const { return mDisasm.instructionName(isn); }
+	const char* registerName(x86_reg reg) const { return mDisasm.registerName(reg); }
 
 private:
 	Disassembler mDisasm;

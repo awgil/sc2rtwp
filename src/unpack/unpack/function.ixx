@@ -746,3 +746,109 @@ private:
 	PEBinary& mBinary;
 	std::map<rva_t, FunctionInfo> mFunctions;
 };
+
+// utility for pretty-printing instructions
+export struct InstructionPrinter
+{
+	const PEBinary& mBin;
+	const Instruction& mIsn;
+
+	InstructionPrinter(const PEBinary& bin, const Instruction& isn) : mBin(bin), mIsn(isn) {}
+};
+
+export template<> struct std::formatter<InstructionPrinter>
+{
+	constexpr auto parse(format_parse_context& ctx)
+	{
+		return ctx.begin();
+	}
+
+	auto formatReg(const PEBinary& bin, x86_reg reg, format_context& ctx) const
+	{
+		return format_to(ctx.out(), "{}", bin.registerName(reg));
+	}
+
+	auto formatSize(u8 size, format_context& ctx) const
+	{
+		switch (size)
+		{
+		case 1: return format_to(ctx.out(), "byte");
+		case 2: return format_to(ctx.out(), "word");
+		case 4: return format_to(ctx.out(), "dword");
+		case 8: return format_to(ctx.out(), "qword");
+		case 16: return format_to(ctx.out(), "xmmword");
+		case 32: return format_to(ctx.out(), "ymmword");
+		case 64: return format_to(ctx.out(), "zmmword");
+		default: return format_to(ctx.out(), "{}", size);
+		}
+	}
+
+	auto formatMem(const PEBinary& bin, u8 size, const x86_op_mem& mem, format_context& ctx) const
+	{
+		formatSize(size, ctx);
+		format_to(ctx.out(), " ptr ");
+		if (mem.segment != X86_REG_INVALID)
+		{
+			formatReg(bin, mem.segment, ctx);
+			*ctx.out()++ = ':';
+		}
+		*ctx.out()++ = '[';
+		formatReg(bin, mem.base, ctx);
+		if (mem.index != X86_REG_INVALID)
+		{
+			format_to(ctx.out(), " + ");
+			if (mem.scale > 1)
+				format_to(ctx.out(), "{} * ", mem.scale);
+			formatReg(bin, mem.index, ctx);
+		}
+		if (mem.disp > 0)
+			format_to(ctx.out(), " + 0x{:X}", mem.disp);
+		else if (mem.disp < 0)
+			format_to(ctx.out(), " - 0x{:X}", -mem.disp);
+		*ctx.out()++ = ']';
+		return ctx.out();
+	}
+
+	auto formatMemRVA(const PEBinary& bin, u8 size, const x86_op_mem& mem, format_context& ctx) const
+	{
+		formatSize(size, ctx);
+		format_to(ctx.out(), " ptr ");
+		assert(mem.segment == X86_REG_INVALID);
+		format_to(ctx.out(), "[rva 0x{}", mem.disp);
+		if (mem.index != X86_REG_INVALID)
+		{
+			format_to(ctx.out(), " + ");
+			if (mem.scale > 1)
+				format_to(ctx.out(), "{} * ", mem.scale);
+			formatReg(bin, mem.index, ctx);
+		}
+		*ctx.out()++ = ']';
+		return ctx.out();
+	}
+
+	auto formatOperand(const PEBinary& bin, const Instruction& isn, const Operand& op, format_context& ctx) const
+	{
+		switch (op.type)
+		{
+		case OperandType::Reg: return formatReg(bin, op.reg, ctx);
+		case OperandType::Imm: return format_to(ctx.out(), "{}", isn.imm);
+		case OperandType::Mem: return formatMem(bin, op.size, isn.mem, ctx);
+		case OperandType::ImmRVA: return format_to(ctx.out(), "rva 0x{:X}", isn.imm);
+		case OperandType::MemRVA: return formatMemRVA(bin, op.size, isn.mem, ctx);
+		default: return format_to(ctx.out(), "???");
+		}
+	}
+
+	auto format(const InstructionPrinter& obj, format_context& ctx) const
+	{
+		format_to(ctx.out(), "{}", obj.mBin.instructionName(obj.mIsn.mnem));
+		for (int i = 0; i < obj.mIsn.opcount; ++i)
+		{
+			if (i != 0)
+				*ctx.out()++ = ',';
+			*ctx.out()++ = ' ';
+			formatOperand(obj.mBin, obj.mIsn, obj.mIsn.ops[i], ctx);
+		}
+		return ctx.out();
+	}
+};
