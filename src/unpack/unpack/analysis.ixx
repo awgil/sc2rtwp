@@ -10,6 +10,7 @@ export module unpack.analysis;
 import std;
 import common;
 import unpack.pe_binary;
+import unpack.instruction;
 import unpack.function;
 
 // an uninterrupted sequence of instructions; each basic block has only one entry point
@@ -194,7 +195,7 @@ struct AnalysisState
 	{
 		AnalysisState res;
 		res.addressSpaces.resize(AS_Count);
-		auto [rspStart, rspEnd] = registerToRange(X86_REG_RSP);
+		auto [rspStart, rspEnd] = RegisterInfo::registerToRange(X86_REG_RSP);
 		res.addressSpaces[AS_Register].insert({ rspStart, rspEnd, AnalysisPointer{ AS_Stack }});
 		res.addressSpaces[AS_TEB].insert({ 0x30, 0x38, AnalysisPointer{ AS_TEB } }); // NtTib.Self
 		res.addressSpaces[AS_TEB].insert({ 0x60, 0x68, AnalysisPointer{ AS_PEB } });
@@ -212,193 +213,6 @@ struct AnalysisState
 		res.addressSpaces[AS_LoaderDataEntry].insert({ 0x20, 0x28, AnalysisPointer{ AS_LoaderDataEntry, 0x20 } }); // InInitializationOrderLinks
 		res.addressSpaces[AS_LoaderDataEntry].insert({ 0x28, 0x30, AnalysisPointer{ AS_LoaderDataEntry, 0x20 } });
 		return res;
-	}
-
-	static std::pair<int, int> registerToOffsetSize(x86_reg reg)
-	{
-		static constexpr int gprStart = 0;
-		static constexpr int gprSize = 8;
-		static auto gprOffset = [](int index) { return gprStart + index * gprSize; };
-		static auto gprPair = [](int index, int size, int offset = 0) { return std::make_pair(gprOffset(index) + offset, size); };
-		static constexpr int xmmStart = gprOffset(16);
-		static constexpr int xmmSize = 64;
-		static auto xmmOffset = [](int index) { return xmmStart + index * xmmSize; };
-		static auto xmmPair = [](int index, int size) { return std::make_pair(xmmOffset(index), size); };
-		// unsupported: flags, ip, segment regs, cr, dr, fpu, mmx, k (avx), bnd
-		switch (reg)
-		{
-		case X86_REG_AL: return gprPair(0, 1);
-		case X86_REG_AH: return gprPair(0, 1, 1);
-		case X86_REG_AX: return gprPair(0, 2);
-		case X86_REG_EAX: return gprPair(0, 4);
-		case X86_REG_RAX: return gprPair(0, 8);
-		case X86_REG_CL: return gprPair(1, 1);
-		case X86_REG_CH: return gprPair(1, 1, 1);
-		case X86_REG_CX: return gprPair(1, 2);
-		case X86_REG_ECX: return gprPair(1, 4);
-		case X86_REG_RCX: return gprPair(1, 8);
-		case X86_REG_DL: return gprPair(2, 1);
-		case X86_REG_DH: return gprPair(2, 1, 1);
-		case X86_REG_DX: return gprPair(2, 2);
-		case X86_REG_EDX: return gprPair(2, 4);
-		case X86_REG_RDX: return gprPair(2, 8);
-		case X86_REG_BL: return gprPair(3, 1);
-		case X86_REG_BH: return gprPair(3, 1, 1);
-		case X86_REG_BX: return gprPair(3, 2);
-		case X86_REG_EBX: return gprPair(3, 4);
-		case X86_REG_RBX: return gprPair(3, 8);
-		case X86_REG_SPL: return gprPair(4, 1);
-		case X86_REG_SP: return gprPair(4, 2);
-		case X86_REG_ESP: return gprPair(4, 4);
-		case X86_REG_RSP: return gprPair(4, 8);
-		case X86_REG_BPL: return gprPair(5, 1);
-		case X86_REG_BP: return gprPair(5, 2);
-		case X86_REG_EBP: return gprPair(5, 4);
-		case X86_REG_RBP: return gprPair(5, 8);
-		case X86_REG_SIL: return gprPair(6, 1);
-		case X86_REG_SI: return gprPair(6, 2);
-		case X86_REG_ESI: return gprPair(6, 4);
-		case X86_REG_RSI: return gprPair(6, 8);
-		case X86_REG_DIL: return gprPair(7, 1);
-		case X86_REG_DI: return gprPair(7, 2);
-		case X86_REG_EDI: return gprPair(7, 4);
-		case X86_REG_RDI: return gprPair(7, 8);
-		case X86_REG_R8B: return gprPair(8, 1);
-		case X86_REG_R8W: return gprPair(8, 2);
-		case X86_REG_R8D: return gprPair(8, 4);
-		case X86_REG_R8: return gprPair(8, 8);
-		case X86_REG_R9B: return gprPair(9, 1);
-		case X86_REG_R9W: return gprPair(9, 2);
-		case X86_REG_R9D: return gprPair(9, 4);
-		case X86_REG_R9: return gprPair(9, 8);
-		case X86_REG_R10B: return gprPair(10, 1);
-		case X86_REG_R10W: return gprPair(10, 2);
-		case X86_REG_R10D: return gprPair(10, 4);
-		case X86_REG_R10: return gprPair(10, 8);
-		case X86_REG_R11B: return gprPair(11, 1);
-		case X86_REG_R11W: return gprPair(11, 2);
-		case X86_REG_R11D: return gprPair(11, 4);
-		case X86_REG_R11: return gprPair(11, 8);
-		case X86_REG_R12B: return gprPair(12, 1);
-		case X86_REG_R12W: return gprPair(12, 2);
-		case X86_REG_R12D: return gprPair(12, 4);
-		case X86_REG_R12: return gprPair(12, 8);
-		case X86_REG_R13B: return gprPair(13, 1);
-		case X86_REG_R13W: return gprPair(13, 2);
-		case X86_REG_R13D: return gprPair(13, 4);
-		case X86_REG_R13: return gprPair(13, 8);
-		case X86_REG_R14B: return gprPair(14, 1);
-		case X86_REG_R14W: return gprPair(14, 2);
-		case X86_REG_R14D: return gprPair(14, 4);
-		case X86_REG_R14: return gprPair(14, 8);
-		case X86_REG_R15B: return gprPair(15, 1);
-		case X86_REG_R15W: return gprPair(15, 2);
-		case X86_REG_R15D: return gprPair(15, 4);
-		case X86_REG_R15: return gprPair(15, 8);
-		case X86_REG_XMM0: return xmmPair(0, 16);
-		case X86_REG_YMM0: return xmmPair(0, 32);
-		case X86_REG_ZMM0: return xmmPair(0, 64);
-		case X86_REG_XMM1: return xmmPair(1, 16);
-		case X86_REG_YMM1: return xmmPair(1, 32);
-		case X86_REG_ZMM1: return xmmPair(1, 64);
-		case X86_REG_XMM2: return xmmPair(2, 16);
-		case X86_REG_YMM2: return xmmPair(2, 32);
-		case X86_REG_ZMM2: return xmmPair(2, 64);
-		case X86_REG_XMM3: return xmmPair(3, 16);
-		case X86_REG_YMM3: return xmmPair(3, 32);
-		case X86_REG_ZMM3: return xmmPair(3, 64);
-		case X86_REG_XMM4: return xmmPair(4, 16);
-		case X86_REG_YMM4: return xmmPair(4, 32);
-		case X86_REG_ZMM4: return xmmPair(4, 64);
-		case X86_REG_XMM5: return xmmPair(5, 16);
-		case X86_REG_YMM5: return xmmPair(5, 32);
-		case X86_REG_ZMM5: return xmmPair(5, 64);
-		case X86_REG_XMM6: return xmmPair(6, 16);
-		case X86_REG_YMM6: return xmmPair(6, 32);
-		case X86_REG_ZMM6: return xmmPair(6, 64);
-		case X86_REG_XMM7: return xmmPair(7, 16);
-		case X86_REG_YMM7: return xmmPair(7, 32);
-		case X86_REG_ZMM7: return xmmPair(7, 64);
-		case X86_REG_XMM8: return xmmPair(8, 16);
-		case X86_REG_YMM8: return xmmPair(8, 32);
-		case X86_REG_ZMM8: return xmmPair(8, 64);
-		case X86_REG_XMM9: return xmmPair(9, 16);
-		case X86_REG_YMM9: return xmmPair(9, 32);
-		case X86_REG_ZMM9: return xmmPair(9, 64);
-		case X86_REG_XMM10: return xmmPair(10, 16);
-		case X86_REG_YMM10: return xmmPair(10, 32);
-		case X86_REG_ZMM10: return xmmPair(10, 64);
-		case X86_REG_XMM11: return xmmPair(11, 16);
-		case X86_REG_YMM11: return xmmPair(11, 32);
-		case X86_REG_ZMM11: return xmmPair(11, 64);
-		case X86_REG_XMM12: return xmmPair(12, 16);
-		case X86_REG_YMM12: return xmmPair(12, 32);
-		case X86_REG_ZMM12: return xmmPair(12, 64);
-		case X86_REG_XMM13: return xmmPair(13, 16);
-		case X86_REG_YMM13: return xmmPair(13, 32);
-		case X86_REG_ZMM13: return xmmPair(13, 64);
-		case X86_REG_XMM14: return xmmPair(14, 16);
-		case X86_REG_YMM14: return xmmPair(14, 32);
-		case X86_REG_ZMM14: return xmmPair(14, 64);
-		case X86_REG_XMM15: return xmmPair(15, 16);
-		case X86_REG_YMM15: return xmmPair(15, 32);
-		case X86_REG_ZMM15: return xmmPair(15, 64);
-		case X86_REG_XMM16: return xmmPair(16, 16);
-		case X86_REG_YMM16: return xmmPair(16, 32);
-		case X86_REG_ZMM16: return xmmPair(16, 64);
-		case X86_REG_XMM17: return xmmPair(17, 16);
-		case X86_REG_YMM17: return xmmPair(17, 32);
-		case X86_REG_ZMM17: return xmmPair(17, 64);
-		case X86_REG_XMM18: return xmmPair(18, 16);
-		case X86_REG_YMM18: return xmmPair(18, 32);
-		case X86_REG_ZMM18: return xmmPair(18, 64);
-		case X86_REG_XMM19: return xmmPair(19, 16);
-		case X86_REG_YMM19: return xmmPair(19, 32);
-		case X86_REG_ZMM19: return xmmPair(19, 64);
-		case X86_REG_XMM20: return xmmPair(20, 16);
-		case X86_REG_YMM20: return xmmPair(20, 32);
-		case X86_REG_ZMM20: return xmmPair(20, 64);
-		case X86_REG_XMM21: return xmmPair(21, 16);
-		case X86_REG_YMM21: return xmmPair(21, 32);
-		case X86_REG_ZMM21: return xmmPair(21, 64);
-		case X86_REG_XMM22: return xmmPair(22, 16);
-		case X86_REG_YMM22: return xmmPair(22, 32);
-		case X86_REG_ZMM22: return xmmPair(22, 64);
-		case X86_REG_XMM23: return xmmPair(23, 16);
-		case X86_REG_YMM23: return xmmPair(23, 32);
-		case X86_REG_ZMM23: return xmmPair(23, 64);
-		case X86_REG_XMM24: return xmmPair(24, 16);
-		case X86_REG_YMM24: return xmmPair(24, 32);
-		case X86_REG_ZMM24: return xmmPair(24, 64);
-		case X86_REG_XMM25: return xmmPair(25, 16);
-		case X86_REG_YMM25: return xmmPair(25, 32);
-		case X86_REG_ZMM25: return xmmPair(25, 64);
-		case X86_REG_XMM26: return xmmPair(26, 16);
-		case X86_REG_YMM26: return xmmPair(26, 32);
-		case X86_REG_ZMM26: return xmmPair(26, 64);
-		case X86_REG_XMM27: return xmmPair(27, 16);
-		case X86_REG_YMM27: return xmmPair(27, 32);
-		case X86_REG_ZMM27: return xmmPair(27, 64);
-		case X86_REG_XMM28: return xmmPair(28, 16);
-		case X86_REG_YMM28: return xmmPair(28, 32);
-		case X86_REG_ZMM28: return xmmPair(28, 64);
-		case X86_REG_XMM29: return xmmPair(29, 16);
-		case X86_REG_YMM29: return xmmPair(29, 32);
-		case X86_REG_ZMM29: return xmmPair(29, 64);
-		case X86_REG_XMM30: return xmmPair(30, 16);
-		case X86_REG_YMM30: return xmmPair(30, 32);
-		case X86_REG_ZMM30: return xmmPair(30, 64);
-		case X86_REG_XMM31: return xmmPair(31, 16);
-		case X86_REG_YMM31: return xmmPair(31, 32);
-		case X86_REG_ZMM31: return xmmPair(31, 64);
-		default: throw std::exception("Unsupported register");
-		}
-	}
-
-	static std::pair<int, int> registerToRange(x86_reg reg)
-	{
-		auto [begin, size] = registerToOffsetSize(reg);
-		return{ begin, begin + size };
 	}
 
 	void merge(const AnalysisState& other)
@@ -436,6 +250,13 @@ struct AnalysisState
 		}
 	}
 };
+
+//export struct AnalysisResult
+//{
+//	std::vector<AnalysisBlock> mBlocks; // sorted in topological (reverse-post) order
+//	std::vector<AnalysisState> mExitStates;
+//	std::vector<AnalysisExpression> mExpressions;
+//};
 
 export class AnalyzedFunction
 {
@@ -597,6 +418,7 @@ private:
 		switch (isn.mnem)
 		{
 		case X86_INS_MOV: return emulateMov(isn);
+		case X86_INS_MOVABS: return emulateMov(isn); // mov reg, imm64
 		case X86_INS_MOVSXD: return emulateMovSX(isn);
 		case X86_INS_MOVZX: return emulateMovZX(isn);
 		case X86_INS_PUSH: return emulatePush(isn);
@@ -780,7 +602,7 @@ private:
 	{
 		assert(isn.opcount == 1 && isn.ops[0].size == 8);
 		// push x ==> sub rsp, 8 + mov [rsp], x
-		auto rsp = AnalysisPointer{ AnalysisState::AS_Register, AnalysisState::registerToOffsetSize(X86_REG_RSP).first };
+		auto rsp = AnalysisPointer{ AnalysisState::AS_Register, RegisterInfo::registerToOffsetSize(X86_REG_RSP).first };
 		auto rspValue = derefLoad(rsp, 8, isn.rva);
 		assert(rspValue.type == AnalysisValueType::Pointer && rspValue.value.ptr.addressSpace == AnalysisState::AS_Stack);
 		rspValue.value.ptr -= 8;
@@ -813,19 +635,19 @@ private:
 		auto callee = read(isn, isn.ops[0]);
 		// TODO: not sure what we want to do with arguments here...
 		auto& state = mExitStates[mCurrentBlockIndex];
-		auto a1 = state.addressSpaces[AnalysisState::AS_Register].find(AnalysisState::registerToOffsetSize(X86_REG_RCX).first);
-		auto a2 = state.addressSpaces[AnalysisState::AS_Register].find(AnalysisState::registerToOffsetSize(X86_REG_RDX).first);
-		auto a3 = state.addressSpaces[AnalysisState::AS_Register].find(AnalysisState::registerToOffsetSize(X86_REG_R8).first);
-		auto a4 = state.addressSpaces[AnalysisState::AS_Register].find(AnalysisState::registerToOffsetSize(X86_REG_R9).first);
-		auto argsRest = derefLoad(AnalysisPointer{ AnalysisState::AS_Register, AnalysisState::registerToOffsetSize(X86_REG_RSP).first }, 8, isn.rva);
+		auto a1 = state.addressSpaces[AnalysisState::AS_Register].find(RegisterInfo::registerToOffsetSize(X86_REG_RCX).first);
+		auto a2 = state.addressSpaces[AnalysisState::AS_Register].find(RegisterInfo::registerToOffsetSize(X86_REG_RDX).first);
+		auto a3 = state.addressSpaces[AnalysisState::AS_Register].find(RegisterInfo::registerToOffsetSize(X86_REG_R8).first);
+		auto a4 = state.addressSpaces[AnalysisState::AS_Register].find(RegisterInfo::registerToOffsetSize(X86_REG_R9).first);
+		auto argsRest = derefLoad(AnalysisPointer{ AnalysisState::AS_Register, RegisterInfo::registerToOffsetSize(X86_REG_RSP).first }, 8, isn.rva);
 		assert(argsRest.type == AnalysisValueType::Pointer && argsRest.value.ptr.addressSpace == AnalysisState::AS_Stack);
 		argsRest.value.ptr += 0x20;
 		// clear all volatile registers
 		// TODO: clear part of stack too? does it even matter?
-		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(AnalysisState::registerToOffsetSize(X86_REG_RAX).first, AnalysisState::registerToRange(X86_REG_RDX).second); // rax/rcx/rdx are contiguous
-		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(AnalysisState::registerToOffsetSize(X86_REG_R8).first, AnalysisState::registerToRange(X86_REG_R10).second); // r8/r9/r10 are contiguous
-		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(AnalysisState::registerToOffsetSize(X86_REG_ZMM0).first, AnalysisState::registerToRange(X86_REG_ZMM5).second); // xmm0-xmm5 are volatile; TODO: upper portions of xmm6-15 are too...
-		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(AnalysisState::registerToOffsetSize(X86_REG_ZMM16).first, AnalysisState::registerToRange(X86_REG_ZMM31).second);
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(RegisterInfo::registerToOffsetSize(X86_REG_RAX).first, RegisterInfo::registerToRange(X86_REG_RDX).second); // rax/rcx/rdx are contiguous
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(RegisterInfo::registerToOffsetSize(X86_REG_R8).first, RegisterInfo::registerToRange(X86_REG_R10).second); // r8/r9/r10 are contiguous
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(RegisterInfo::registerToOffsetSize(X86_REG_ZMM0).first, RegisterInfo::registerToRange(X86_REG_ZMM5).second); // xmm0-xmm5 are volatile; TODO: upper portions of xmm6-15 are too...
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(RegisterInfo::registerToOffsetSize(X86_REG_ZMM16).first, RegisterInfo::registerToRange(X86_REG_ZMM31).second);
 		derefStore(regToPtr(X86_REG_RAX, 8), 8, isn.rva, addExpression(isn.rva, AnalysisExpression(8, AnalysisExpressionOp::Call, callee)));
 	}
 
@@ -837,7 +659,7 @@ private:
 
 	AnalysisPointer regToPtr(x86_reg reg, int expectedSize)
 	{
-		auto [offset, size] = AnalysisState::registerToOffsetSize(reg);
+		auto [offset, size] = RegisterInfo::registerToOffsetSize(reg);
 		ensure(size == expectedSize);
 		return AnalysisPointer{ AnalysisState::AS_Register, offset };
 	}

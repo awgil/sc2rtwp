@@ -23,7 +23,7 @@ export struct BootstrapInfo
 	u32 rvaEntryPoint;
 	SectionRemapInfo sections[32];
 	AddressSizePair pageRegions[32];
-	char f288[256];
+	AddressSizePair f288[32];
 	u32 textRVA;
 	u32 textSize;
 	u32 rdataRVA;
@@ -55,6 +55,22 @@ export struct BootstrapStartState
 	u32 vehVal2;
 };
 static_assert(sizeof(BootstrapStartState) == 0x418);
+
+export struct MappedRegionInfo
+{
+	void* ptr;
+	int size;
+};
+static_assert(sizeof(MappedRegionInfo) == 0x10);
+
+// known executable regions, stored in .rdata
+export struct MappedRegions
+{
+	MappedRegionInfo textSection; // bounds match .text but are read from bootstrap info
+	MappedRegionInfo executableRegion; // bounds are union of all sections marked as executable in PE header
+	MappedRegionInfo rdataSection; // bounds match .rdata but are read from bootstrap info
+};
+static_assert(sizeof(MappedRegions) == 0x30);
 
 // heap-allocated part of the antitamper state
 // most fields are encoded, the algorithm is hardcoded everywhere it's accessed and uses some hardcoded constants - won't be surprised if they are different in every build
@@ -98,10 +114,10 @@ export struct AntitamperStaticState
 
 	char f1aa0[0x420]; // no idea what's here...
 
-	bool decryptionPartiallyDone; // ???
+	bool vehDecryptionFailed; // ???
 	u64 bootstrapRegionHash;
 	u64 bootstrapRegionHashMismatch;
-	u64 xorredSectionMapping;
+	void* writableSectionMapping; // plain pointer to writable mapping of the entire executable
 	u64 vehDecryptionDone; // initially 0, set to some constant when obfuscate() is decrypted
 	u64 pad2;
 

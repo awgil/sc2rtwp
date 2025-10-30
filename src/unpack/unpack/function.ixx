@@ -9,6 +9,7 @@ export module unpack.function;
 import std;
 import common;
 import unpack.pe_binary;
+import unpack.instruction;
 
 // Conditionals (first instruction is 'jump when set', second is 'jump if not set')
 enum class Conditional : u8
@@ -104,39 +105,6 @@ export enum class EdgeFlags : u8
 	Indirect = 1 << 3, // part of switch statement
 };
 ADD_BITFIELD_OPS(EdgeFlags);
-
-export enum class OperandType : u8
-{
-	Invalid, // not an operand
-	Reg,
-	Imm,
-	Mem,
-	ImmRVA, // immediate, to be treated as RVA (jump/call)
-	MemRVA, // memory; base is to be ignored (assumed 0), displacement is rva (rip-relative)
-};
-
-// TODO: improve..
-export struct Operand
-{
-	OperandType type;
-	u8 size;
-	x86_reg reg : 9; // only valid if type == Reg
-	cs_ac_type access : 7;
-};
-//static_assert(sizeof(Operand) == 4);
-
-// TODO: this can be seriously improved (eg max 1 memory access, max 1 displacement, ...)
-export struct Instruction
-{
-	rva_t rva;
-	x86_insn mnem;
-	u8 opcount;
-	Operand ops[4];
-	x86_op_mem mem; // data for memory operand (if any)
-	int64_t imm; // immediate operand value (if any)
-
-	std::span<Operand> operands() { return { ops, opcount }; }
-};
 
 // edge between two blocks
 export struct FunctionEdge
@@ -275,6 +243,15 @@ private:
 	{
 		std::span<cs_x86_op> operands{ isn->detail->x86.operands, isn->detail->x86.op_count };
 		Instruction result{ rva, static_cast<x86_insn>(isn->id), static_cast<u8>(operands.size()) };
+
+		if (result.mnem == X86_INS_MOVSB)
+		{
+			// movsb has two implicit memory operands
+			assert(result.opcount == 2 && operands[0].type == X86_OP_MEM && operands[0].mem.base == X86_REG_RDI && operands[1].type == X86_OP_MEM && operands[1].mem.base == X86_REG_RSI);
+			result.opcount = 0;
+			return result;
+		}
+
 		if (result.opcount > 0)
 		{
 			ensure(result.opcount <= std::extent_v<decltype(Instruction::ops)>);
@@ -339,10 +316,7 @@ private:
 				result.ops[0].type = OperandType::ImmRVA;
 				result.imm = mBinary.vaToRVA(result.imm);
 			}
-			else
-			{
-				ensure(result.ops[0].type == OperandType::Reg); // is that right?..
-			}
+			// else: reg or mem
 			break;
 		case X86_INS_JCXZ:
 		case X86_INS_JECXZ:
@@ -579,6 +553,17 @@ private:
 			mBinary.bytes()[rva] = 0xF1;
 		}
 
+		// help ida - get rid of rbp overalign in prologue
+		auto rbpOveralign = std::ranges::find_if(mBlocks[0].instructions, [](const Instruction& isn) {
+			return isn.mnem == X86_INS_AND && isn.opcount == 2 && isn.ops[0].type == OperandType::Reg && isn.ops[0].reg == X86_REG_RBP && isn.ops[0].size == 8 && isn.ops[1].type == OperandType::Imm && isn.imm == ~0x1F;
+		});
+		if (rbpOveralign != mBlocks[0].instructions.end())
+		{
+			auto& immByte = reinterpret_cast<u8&>(mBinary.bytes()[rbpOveralign->rva + 3]);
+			ensure(immByte == 0xE0);
+			immByte = 0xFF;
+		}
+
 		// patch jumps
 		for (auto rva : mJumpChains)
 		{
@@ -676,8 +661,8 @@ public:
 					auto& op = isn.ops[iOp];
 					if (op.type == OperandType::MemRVA)
 					{
-						ensure(op.access == (iOp == 0 ? CS_AC_WRITE : CS_AC_READ)); // ???
-						auto type = iOp == 0 ? ReferenceType::Write : isn.mnem == X86_INS_LEA ? ReferenceType::Address : ReferenceType::Read;
+						auto type = isn.mnem == X86_INS_LEA && iOp != 0 ? ReferenceType::Address : op.access == CS_AC_READ ? ReferenceType::Read : ReferenceType::Write;
+						//ensure(op.access == (iOp == 0 ? CS_AC_WRITE : CS_AC_READ)); // ???
 						mRefs.push_back({ isn.rva, static_cast<rva_t>(isn.mem.disp), type });
 					}
 				}
@@ -690,12 +675,22 @@ public:
 		}
 	}
 
+	const rva_t startRVA() const { return mStartRVA; }
+	const rva_t endRVA() const { return mEndRVA; }
 	const auto& blocks() const { return mBlocks; }
 	const FunctionBlock* findBlock(rva_t rva) const { return mBlocks.find(rva); }
 	const auto& refs() const { return mRefs; }
 
 	auto calls() const { return mRefs | std::ranges::views::filter([](const Reference& ref) { return ref.type == ReferenceType::Call; }); }
 	auto refsToSection(const PEBinary::Section& section) const { return mRefs | std::ranges::views::filter([&section](const Reference& ref) { return section.contains(ref.refRVA); }); }
+
+	// find specific reference; return pointer if found, null if not
+	auto findRef(auto&& predicate) const
+	{
+		auto it = std::ranges::find_if(mRefs, predicate);
+		return it != mRefs.end() ? &*it : nullptr;
+	}
+	auto findRefTo(rva_t refRVA) const { return findRef([refRVA](const auto& ref) { return ref.refRVA == refRVA; }); }
 
 	void gatherCodeRefs(std::vector<rva_t>& refs, const PEBinary::Section& codeSection) const
 	{
@@ -745,110 +740,4 @@ public:
 private:
 	PEBinary& mBinary;
 	std::map<rva_t, FunctionInfo> mFunctions;
-};
-
-// utility for pretty-printing instructions
-export struct InstructionPrinter
-{
-	const PEBinary& mBin;
-	const Instruction& mIsn;
-
-	InstructionPrinter(const PEBinary& bin, const Instruction& isn) : mBin(bin), mIsn(isn) {}
-};
-
-export template<> struct std::formatter<InstructionPrinter>
-{
-	constexpr auto parse(format_parse_context& ctx)
-	{
-		return ctx.begin();
-	}
-
-	auto formatReg(const PEBinary& bin, x86_reg reg, format_context& ctx) const
-	{
-		return format_to(ctx.out(), "{}", bin.registerName(reg));
-	}
-
-	auto formatSize(u8 size, format_context& ctx) const
-	{
-		switch (size)
-		{
-		case 1: return format_to(ctx.out(), "byte");
-		case 2: return format_to(ctx.out(), "word");
-		case 4: return format_to(ctx.out(), "dword");
-		case 8: return format_to(ctx.out(), "qword");
-		case 16: return format_to(ctx.out(), "xmmword");
-		case 32: return format_to(ctx.out(), "ymmword");
-		case 64: return format_to(ctx.out(), "zmmword");
-		default: return format_to(ctx.out(), "{}", size);
-		}
-	}
-
-	auto formatMem(const PEBinary& bin, u8 size, const x86_op_mem& mem, format_context& ctx) const
-	{
-		formatSize(size, ctx);
-		format_to(ctx.out(), " ptr ");
-		if (mem.segment != X86_REG_INVALID)
-		{
-			formatReg(bin, mem.segment, ctx);
-			*ctx.out()++ = ':';
-		}
-		*ctx.out()++ = '[';
-		formatReg(bin, mem.base, ctx);
-		if (mem.index != X86_REG_INVALID)
-		{
-			format_to(ctx.out(), " + ");
-			if (mem.scale > 1)
-				format_to(ctx.out(), "{} * ", mem.scale);
-			formatReg(bin, mem.index, ctx);
-		}
-		if (mem.disp > 0)
-			format_to(ctx.out(), " + 0x{:X}", mem.disp);
-		else if (mem.disp < 0)
-			format_to(ctx.out(), " - 0x{:X}", -mem.disp);
-		*ctx.out()++ = ']';
-		return ctx.out();
-	}
-
-	auto formatMemRVA(const PEBinary& bin, u8 size, const x86_op_mem& mem, format_context& ctx) const
-	{
-		formatSize(size, ctx);
-		format_to(ctx.out(), " ptr ");
-		assert(mem.segment == X86_REG_INVALID);
-		format_to(ctx.out(), "[rva 0x{}", mem.disp);
-		if (mem.index != X86_REG_INVALID)
-		{
-			format_to(ctx.out(), " + ");
-			if (mem.scale > 1)
-				format_to(ctx.out(), "{} * ", mem.scale);
-			formatReg(bin, mem.index, ctx);
-		}
-		*ctx.out()++ = ']';
-		return ctx.out();
-	}
-
-	auto formatOperand(const PEBinary& bin, const Instruction& isn, const Operand& op, format_context& ctx) const
-	{
-		switch (op.type)
-		{
-		case OperandType::Reg: return formatReg(bin, op.reg, ctx);
-		case OperandType::Imm: return format_to(ctx.out(), "{}", isn.imm);
-		case OperandType::Mem: return formatMem(bin, op.size, isn.mem, ctx);
-		case OperandType::ImmRVA: return format_to(ctx.out(), "rva 0x{:X}", isn.imm);
-		case OperandType::MemRVA: return formatMemRVA(bin, op.size, isn.mem, ctx);
-		default: return format_to(ctx.out(), "???");
-		}
-	}
-
-	auto format(const InstructionPrinter& obj, format_context& ctx) const
-	{
-		format_to(ctx.out(), "{}", obj.mBin.instructionName(obj.mIsn.mnem));
-		for (int i = 0; i < obj.mIsn.opcount; ++i)
-		{
-			if (i != 0)
-				*ctx.out()++ = ',';
-			*ctx.out()++ = ' ';
-			formatOperand(obj.mBin, obj.mIsn, obj.mIsn.ops[i], ctx);
-		}
-		return ctx.out();
-	}
 };
