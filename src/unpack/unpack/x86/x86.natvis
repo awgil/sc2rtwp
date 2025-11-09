@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+
+  <Type Name="x86::Reg">
+    <DisplayString>{mValue,en}</DisplayString>
+  </Type>
+
+  <Type Name="x86::OpMem">
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; base.mValue == 0 &amp;&amp; index.mValue == 0">[{displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; base.mValue == 0 &amp;&amp; displacement == 0">[{(int)scale,d} * {index}]</DisplayString>
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; base.mValue == 0 &amp;&amp; displacement &gt; 0">[{(int)scale,d} * {index} + {displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; base.mValue == 0 &amp;&amp; displacement &lt; 0">[{(int)scale,d} * {index} - {-displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; base.mValue == Reg::imagebase &amp;&amp; index.mValue == 0">[rva {displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; base.mValue == Reg::imagebase &amp;&amp; index.mValue != 0">[rva {displacement,x} + {(int)scale,d} * {index}]</DisplayString>
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; index.mValue == 0 &amp;&amp; displacement == 0">[{base}]</DisplayString>
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; index.mValue == 0 &amp;&amp; displacement &gt; 0">[{base} + {displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; index.mValue == 0 &amp;&amp; displacement &lt; 0">[{base} - {-displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; index.mValue != 0 &amp;&amp; displacement == 0">[{base} + {(int)scale,d} * {index}]</DisplayString>
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; index.mValue != 0 &amp;&amp; displacement &gt; 0">[{base} + {(int)scale,d} * {index} + {displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue == 0 &amp;&amp; index.mValue != 0 &amp;&amp; displacement &lt; 0">[{base} + {(int)scale,d} * {index} - {-displacement,x}]</DisplayString>
+
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; base.mValue == 0 &amp;&amp; index.mValue == 0">{seg}:[{displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; base.mValue == 0 &amp;&amp; displacement == 0">{seg}:[{(int)scale,d} * {index}]</DisplayString>
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; base.mValue == 0 &amp;&amp; displacement &gt; 0">{seg}:[{(int)scale,d} * {index} + {displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; base.mValue == 0 &amp;&amp; displacement &lt; 0">{seg}:[{(int)scale,d} * {index} - {-displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; base.mValue == Reg::imagebase &amp;&amp; index.mValue == 0">{seg}:[rva {displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; base.mValue == Reg::imagebase &amp;&amp; index.mValue != 0">{seg}:[rva {displacement,x} + {(int)scale,d} * {index}]</DisplayString>
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; index.mValue == 0 &amp;&amp; displacement == 0">{seg}:[{base}]</DisplayString>
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; index.mValue == 0 &amp;&amp; displacement &gt; 0">{seg}:[{base} + {displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; index.mValue == 0 &amp;&amp; displacement &lt; 0">{seg}:[{base} - {-displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; index.mValue != 0 &amp;&amp; displacement == 0">{seg}:[{base} + {(int)scale,d} * {index}]</DisplayString>
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; index.mValue != 0 &amp;&amp; displacement &gt; 0">{seg}:[{base} + {(int)scale,d} * {index} + {displacement,x}]</DisplayString>
+    <DisplayString Condition="seg.mValue != 0 &amp;&amp; index.mValue != 0 &amp;&amp; displacement &lt; 0">{seg}:[{base} + {(int)scale,d} * {index} - {-displacement,x}]</DisplayString>
+  </Type>
+
+  <Type Name="x86::Operand">
+    <DisplayString Condition="type == OpType::Reg">{reg}</DisplayString>
+    <DisplayString Condition="type == OpType::Imm &amp;&amp; size == 1">{(char)imm,nvo}</DisplayString>
+    <DisplayString Condition="type == OpType::Imm &amp;&amp; size == 2">{(short)imm}</DisplayString>
+    <DisplayString Condition="type == OpType::Imm &amp;&amp; size == 4">{(int)imm}</DisplayString>
+    <DisplayString Condition="type == OpType::Imm">{imm}</DisplayString>
+    <DisplayString Condition="type == OpType::Mem &amp;&amp; size == 1">byte ptr {mem}</DisplayString>
+    <DisplayString Condition="type == OpType::Mem &amp;&amp; size == 2">word ptr {mem}</DisplayString>
+    <DisplayString Condition="type == OpType::Mem &amp;&amp; size == 4">dword ptr {mem}</DisplayString>
+    <DisplayString Condition="type == OpType::Mem &amp;&amp; size == 8">qword ptr {mem}</DisplayString>
+    <DisplayString Condition="type == OpType::Mem &amp;&amp; size == 16">xmmword ptr {mem}</DisplayString>
+    <DisplayString Condition="type == OpType::Mem &amp;&amp; size == 32">ymmword ptr {mem}</DisplayString>
+    <DisplayString Condition="type == OpType::Mem &amp;&amp; size == 64">zmmword ptr {mem}</DisplayString>
+    <DisplayString Condition="type == OpType::Mem">{(int)size,d} ptr {mem}</DisplayString>
+    <DisplayString>???</DisplayString>
+  </Type>
+
+  <!-- TODO: use meta to look up better name; for some reason, natvis can't resolve it - figure out why -->
+  <Type Name="x86::Mnem">
+    <DisplayString>{mValue,en}</DisplayString>
+  </Type>
+
+  <Type Name="x86::Instruction">
+    <DisplayString Condition="opcount == 0">{rva,x}: {mnem}</DisplayString>
+    <DisplayString Condition="opcount == 1">{rva,x}: {mnem} {ops[0]}</DisplayString>
+    <DisplayString Condition="opcount == 2">{rva,x}: {mnem} {ops[0]}, {ops[1]}</DisplayString>
+    <DisplayString Condition="opcount == 3">{rva,x}: {mnem} {ops[0]}, {ops[1]}, {ops[2]}</DisplayString>
+    <DisplayString Condition="opcount == 4">{rva,x}: {mnem} {ops[0]}, {ops[1]}, {ops[2]}, {ops[3]}</DisplayString>
+  </Type>
+
+</AutoVisualizer>

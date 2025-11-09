@@ -5,8 +5,9 @@ import std;
 import common;
 import unpack.pe_binary;
 import unpack.function;
-import unpack.analysis;
 import unpack.known_structs;
+
+import unpack.analysis.function_block;
 
 template<typename T, typename F> constexpr size_t fieldOffset(F (T::*f))
 {
@@ -160,6 +161,9 @@ private:
 	// process fallback start function
 	void processBootstrapStart()
 	{
+		auto fsec = mBinary.findSEHEntry(mBinary.entryPoint());
+		auto fb = analysis::FunctionBlockAnalysis().analyze(mBinary.bytes(), mBinary.entryPoint(), fsec->end);
+
 		auto& start = mFuncs.process(mBinary.entryPoint(), "bootstrapStart");
 		matchDataFieldRefs(start, &BootstrapStartState::stage);
 		matchTextReferences(start);
@@ -169,7 +173,7 @@ private:
 	// process TLS callbacks that do the actual decoding
 	void processTLSCallbacks()
 	{
-		// note: tls directory is in .rdata, just preceeding RTTI data...
+		// note: tls directory is in .rdata, just preceding RTTI data...
 		ensure(mBinary.tlsCallbackRVAs().size() == 1);
 		auto& tlsInitial = mFuncs.process(mBinary.tlsCallbackRVAs().front(), "bootstrapTLSInitial");
 		matchDataFieldRefs(tlsInitial,
@@ -280,11 +284,11 @@ private:
 			auto iIsn = iBlock->findInstruction(iRef->insnRVA);
 			--iIsn;
 			ensure(iIsn->mnem == X86_INS_DIV && iIsn->opcount == 1 && iIsn->ops[0].type == OperandType::Reg);
-			auto [numPagesReg, numPagesSize] = RegisterInfo::registerToOffsetSize(iIsn->ops[0].reg);
+			auto [numPagesReg, numPagesSize] = Register::toOffsetSize(iIsn->ops[0].reg);
 			// preceeded by mov reg64, ...
 			--iIsn;
 			ensure(iIsn->mnem == X86_INS_MOV && iIsn->opcount == 2 && iIsn->ops[0].type == OperandType::Reg);
-			auto [preceedingReg, preceedingSize] = RegisterInfo::registerToOffsetSize(iIsn->ops[0].reg);
+			auto [preceedingReg, preceedingSize] = Register::toOffsetSize(iIsn->ops[0].reg);
 			ensure(numPagesReg == preceedingReg && numPagesSize == 4 && preceedingSize == 8);
 			numPagesReg >>= 3;
 			ensure(numPagesReg < 16);
@@ -652,11 +656,11 @@ private:
 		auto shuffleRef = findNextIndirectReference(func, imagebaseReg, lookupStartRVA);
 		ensure(mSectionRData.contains(shuffleRef.refRVA));
 		mShuffle.resolve(shuffleRef.refRVA);
-		auto shuffle = reinterpret_cast<unsigned char*>(&mBinary.bytes()[shuffleRef.refRVA]);
+		auto shuffle = &mBinary.bytes()[shuffleRef.refRVA];
 
 		auto infoRef = findNextIndirectReference(func, imagebaseReg, shuffleRef.insnRVA);
 		ensure(infoRef.refRVA == mBSS.address() + fieldOffset(&BootstrapStartState::encryptedInfo));
-		auto info = reinterpret_cast<unsigned char*>(&mBinary.bytes()[infoRef.refRVA]);
+		auto info = &mBinary.bytes()[infoRef.refRVA];
 
 		unsigned char buffer[256];
 		for (int i = 0; i < sizeof buffer; ++i)
@@ -689,7 +693,7 @@ private:
 	void decodeImports()
 	{
 		int shuffleIndex = 0;
-		auto shuffle = reinterpret_cast<unsigned char*>(&mBinary.bytes()[mShuffle.address()]);
+		auto shuffle = &mBinary.bytes()[mShuffle.address()];
 		auto simpleDecode = [&](auto& value) {
 			auto p = reinterpret_cast<unsigned char*>(&value);
 			for (int i = 0; i < sizeof value; ++i)
@@ -717,7 +721,7 @@ private:
 			simpleDecode(*entry);
 			ensure(mSectionRData.contains(entry->OriginalFirstThunk) && mSectionRData.contains(entry->Name) && mSectionRData.contains(entry->FirstThunk));
 
-			auto libName = &mBinary.bytes()[entry->Name];
+			auto libName = mBinary.structAtRVA<char>(entry->Name);
 			decodeString(libName);
 			//std::println("> Importing {}, IAT @ {:X}", libName, entry->FirstThunk);
 
@@ -732,7 +736,7 @@ private:
 				{
 					// import by name
 					ensure(mSectionRData.contains(*curImport));
-					auto funcName = &mBinary.bytes()[*curImport + 2];
+					auto funcName = mBinary.structAtRVA<char>(*curImport + 2);
 					decodeString(funcName);
 					//std::println(">> Function {}", funcName);
 				}

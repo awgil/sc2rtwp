@@ -1,0 +1,184 @@
+export module unpack.analysis.function_block;
+
+export import unpack.range_map;
+export import unpack.analysis.jump_chain;
+
+namespace analysis {
+
+export struct FunctionBlock : RangeMapEntry<i32>
+{
+	i32 insBegin; // index of the first instruction belonging to this block
+	i32 insEnd; // index of the first instruction after this block
+	SmallVector<i32, 2> successors; // indices of successor blocks
+};
+
+export struct Function
+{
+	std::vector<x86::Instruction> instructions; // sorted by rva
+	RangeMap<FunctionBlock> blocks;
+};
+
+// debug logging
+enum class LogLevel { None, Important, Verbose };
+constexpr LogLevel gLogLevel = LogLevel::None;
+
+template<typename... Args>
+void log(LogLevel level, std::format_string<Args...> fmt, Args&&... args)
+{
+	if (level > gLogLevel)
+		return;
+	std::print("[FuncBlock] ");
+	std::println(fmt, std::forward<Args>(args)...);
+}
+
+void log(LogLevel level, const x86::Instruction& ins, std::string_view message) { log(level, ">> {:X}: {} = {}", ins.rva, ins, message); }
+
+// utility for finding all blocks in a function
+// consider reusing the instance of this class for analyzing multiple functions, to save on some allocations
+export class FunctionBlockAnalysis
+{
+public:
+	Function analyze(std::span<const u8> bytes, i32 start, i32 limit)
+	{
+		mBytes = bytes;
+		mCurStart = start;
+		mCurLimit = limit;
+		log(LogLevel::Important, "analyzing {:X}-{:X}", mCurStart, mCurLimit);
+		mPendingBlockStarts.push_back(start);
+		while (!mPendingBlockStarts.empty())
+		{
+			auto rva = mPendingBlockStarts.back();
+			mPendingBlockStarts.pop_back();
+			analyzeBlock(rva);
+		}
+
+		// ok, now fix up data
+		Function result;
+		result.instructions.reserve(mInstructions.size());
+		for (auto& block : mBlocks)
+		{
+			auto blockInstructions = instructions(block);
+			block.insBegin = static_cast<i32>(result.instructions.size());
+			result.instructions.append_range(blockInstructions);
+			block.insEnd = static_cast<i32>(result.instructions.size());
+			for (auto& succ : block.successors)
+				succ = mBlocks.findIndex(succ);
+		}
+		mInstructions.clear();
+		result.blocks = std::move(mBlocks);
+		return result;
+	}
+
+private:
+	void analyzeBlock(i32 rva)
+	{
+		auto nextBlock = mBlocks.findNext(rva);
+		auto existing = mBlocks.getPrevIfContains(nextBlock, rva);
+		if (existing == mBlocks.end())
+		{
+			// disassemble new block...
+			auto blockLimit = nextBlock != mBlocks.end() ? nextBlock->begin : mCurLimit;
+			log(LogLevel::Important, "> block {:X}-{:X}", rva, blockLimit);
+			auto newBlock = analyzeNewBlock(rva, blockLimit);
+			ensure(newBlock.end <= blockLimit);
+			mBlocks.insert(std::move(newBlock), nextBlock);
+		}
+		else if (existing->begin != rva)
+		{
+			// split existing block
+			log(LogLevel::Important, "> splitting {:X}-{:X} at {:X}", existing->begin, existing->end, rva);
+			auto ispan = instructions(*existing);
+			auto isplit = std::ranges::find(ispan, rva, &x86::Instruction::rva);
+			ensure(isplit != ispan.end());
+			auto splitIndex = existing->insBegin + static_cast<i32>(isplit - ispan.begin());
+
+			FunctionBlock pred{ existing->begin, rva, existing->insBegin, splitIndex, { rva } };
+			mBlocks.edit(existing).insBegin = splitIndex;
+			mBlocks.shrink(rva, existing->end, existing);
+			mBlocks.insert(std::move(pred), nextBlock - 1);
+		}
+		// else: this block was already processed, nothing to do here...
+	}
+
+	FunctionBlock analyzeNewBlock(i32 rva, i32 limit)
+	{
+		FunctionBlock newBlock{ rva, rva, static_cast<i32>(mInstructions.size()) };
+		while (true)
+		{
+			auto& ins = mInstructions.emplace_back(disasmResolveJumpChains(mBytes, newBlock.end));
+			newBlock.end += ins.length;
+			if (ins.mnem == X86_INS_RET || ins.mnem == X86_INS_INT && ins.ops[0] == 0x29)
+			{
+				log(LogLevel::Verbose, ins, "ret");
+				break; // ret or int 0x29 end the final blocks of the function
+			}
+			else if (ins.mnem == X86_INS_JMP)
+			{
+				log(LogLevel::Verbose, ins, "jmp");
+				processJump(newBlock, ins);
+				break; // unconditional jump ends the block
+			}
+			else if (ins.mnem.isConditionalJump())
+			{
+				log(LogLevel::Verbose, ins, "jcc");
+				newBlock.successors.push_back(newBlock.end); // implicit flow edge should be first (before conditional jump)
+				processJump(newBlock, ins);
+				mPendingBlockStarts.push_back(newBlock.end); // process flow edge first...
+				break;
+			}
+			else if (newBlock.end == limit)
+			{
+				// we've reached a point where someone else jumped to, end the block now
+				log(LogLevel::Verbose, ins, "limit reached");
+				newBlock.successors.push_back(newBlock.end);
+				break;
+			}
+			else
+			{
+				log(LogLevel::Verbose, ins, "flow");
+				ensure(newBlock.end < limit);
+				// continue...
+			}
+		}
+		newBlock.insEnd = static_cast<i32>(mInstructions.size());
+		return newBlock;
+	}
+
+	void processJump(FunctionBlock& block, const x86::Instruction& ins)
+	{
+		if (ins.ops[0].type == x86::OpType::Imm)
+		{
+			auto target = ins.ops[0].immediate<i32>();
+			// TODO: process tail recursion jumps...
+			ensure(target >= mCurStart && target < mCurLimit);
+			log(LogLevel::Important, "> scheduling [{:X}] {:X} -> {:X}", block.begin, ins.rva, target);
+
+			//auto flags = isn.mnem == X86_INS_JMP ? EdgeFlags::Unconditional : EdgeFlags::None;
+			//if (isn.rva + 1 == block.end)
+			//	flags |= EdgeFlags::PatchedChain; // real jumps can't be 1-byte
+			block.successors.push_back(target);
+			mPendingBlockStarts.push_back(target);
+		}
+		else
+		{
+			// TODO: process switches...
+			__debugbreak();
+		}
+	}
+
+	std::span<x86::Instruction> instructions(const FunctionBlock& block)
+	{
+		return std::span(mInstructions).subspan(block.insBegin, block.insEnd - block.insBegin);
+	}
+
+private:
+	std::span<const u8> mBytes{};
+	i32 mCurStart{};
+	i32 mCurLimit{};
+	std::vector<x86::Instruction> mInstructions;
+	RangeMap<FunctionBlock> mBlocks;
+	std::vector<i32> mPendingBlockStarts; // blocks to be analyzed
+};
+
+
+}

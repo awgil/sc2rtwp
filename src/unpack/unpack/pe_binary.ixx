@@ -9,14 +9,14 @@ import std;
 import common;
 export import unpack.range_map;
 
-export using va_t = uint64_t;
+export using va_t = u64;
 export using rva_t = int;
 
 // simple utility for reading binary
 class BinaryReader
 {
 public:
-	BinaryReader(const char* path) : mStream(path, std::ios::binary) {}
+	explicit BinaryReader(const char* path) : mStream(path, std::ios::binary) {}
 
 	void readRaw(size_t offset, void* buffer, size_t size)
 	{
@@ -40,7 +40,7 @@ private:
 class BinaryWriter
 {
 public:
-	BinaryWriter(const char* path) : mStream(path, std::ios::binary) {}
+	explicit BinaryWriter(const char* path) : mStream(path, std::ios::binary) {}
 
 	void writeRaw(size_t offset, const void* buffer, size_t size)
 	{
@@ -91,7 +91,7 @@ public:
 	using Sections = NamedRangeMap<rva_t, IMAGE_SECTION_HEADER*, std::string_view>;
 	using Section = Sections::Entry;
 
-	RawPEBinary(const char* path)
+	explicit RawPEBinary(const char* path)
 	{
 		BinaryReader source{ path };
 
@@ -154,8 +154,8 @@ protected:
 private:
 	void initHeaders()
 	{
-		auto& dosHeader = reinterpret_cast<IMAGE_DOS_HEADER&>(mBytes[0]);
-		mPEHeader = reinterpret_cast<IMAGE_NT_HEADERS64*>(&mBytes[dosHeader.e_lfanew]);
+		auto dosHeader = structAtRVA<IMAGE_DOS_HEADER>(0);
+		mPEHeader = structAtRVA<IMAGE_NT_HEADERS64>(dosHeader->e_lfanew);
 		mSectionHeaders = std::span<IMAGE_SECTION_HEADER>{ reinterpret_cast<IMAGE_SECTION_HEADER*>(mPEHeader + 1), mPEHeader->FileHeader.NumberOfSections };
 		mSections.clear();
 		for (auto& section : mSectionHeaders)
@@ -169,7 +169,7 @@ private:
 	}
 
 protected:
-	std::vector<char> mBytes;
+	std::vector<u8> mBytes;
 	IMAGE_NT_HEADERS64* mPEHeader;
 	std::span<IMAGE_SECTION_HEADER> mSectionHeaders;
 	Sections mSections;
@@ -322,7 +322,7 @@ public:
 	// note: the returned pointer is only valid until next disasm call!
 	cs_insn* disasm(rva_t rva) const
 	{
-		return mDisasm.disasm(reinterpret_cast<const uint8_t*>(mBytes.data() + rva), mBytes.size() - rva, imageBase() + rva);
+		return mDisasm.disasm(mBytes.data() + rva, mBytes.size() - rva, imageBase() + rva);
 	}
 
 	const char* instructionName(x86_insn isn) const { return mDisasm.instructionName(isn); }

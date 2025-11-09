@@ -44,7 +44,7 @@ public:
 		return std::ranges::upper_bound(mEntries, key, std::less(), [](const Entry& e) { return e.begin; });
 	}
 
-	// if the iterator (assumed to be returned by findNext) points to the entry right after entry containing the key, return preceeding iterator; otherwise return end()
+	// if the iterator (assumed to be returned by findNext) points to the entry right after entry containing the key, return preceding iterator; otherwise return end()
 	auto getPrevIfContains(auto next, const Key& key) const
 	{
 		if (next == begin())
@@ -82,7 +82,7 @@ public:
 		return insert(std::move(e), next);
 	}
 
-	// extend preceeding entry to include new range
+	// extend preceding entry to include new range
 	// gaps are not allowed: added range should start right as entry-to-be-extended ends
 	// ensures no overlap is created
 	// if specified, hint should be an iterator for next entry (i.e. equal to findNext(begin))

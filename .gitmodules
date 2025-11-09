@@ -1,3 +1,6 @@
 [submodule "thirdparty/capstone"]
 	path = thirdparty/capstone
 	url = https://github.com/capstone-engine/capstone.git
+[submodule "thirdparty/reflect-cpp"]
+	path = thirdparty/reflect-cpp
+	url = https://github.com/getml/reflect-cpp.git

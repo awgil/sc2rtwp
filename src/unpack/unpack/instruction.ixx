@@ -1,7 +1,5 @@
 module;
 
-//#include <common/bitfield_ops.h>
-//#include <common/win_headers.h>
 #include <capstone/capstone.h>
 
 export module unpack.instruction;
@@ -10,10 +8,10 @@ import std;
 import common;
 import unpack.pe_binary;
 
-export struct RegisterInfo
+export struct Register
 {
 	// offset is in virtual register file
-	static std::pair<int, int> registerToOffsetSize(x86_reg reg)
+	static std::pair<int, int> toOffsetSize(x86_reg reg)
 	{
 		static constexpr int gprStart = 0;
 		static constexpr int gprSize = 8;
@@ -194,9 +192,9 @@ export struct RegisterInfo
 		}
 	}
 
-	static std::pair<int, int> registerToRange(x86_reg reg)
+	static std::pair<int, int> toRange(x86_reg reg)
 	{
-		auto [begin, size] = registerToOffsetSize(reg);
+		auto [begin, size] = toOffsetSize(reg);
 		return{ begin, begin + size };
 	}
 };

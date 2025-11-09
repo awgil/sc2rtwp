@@ -559,7 +559,7 @@ private:
 		});
 		if (rbpOveralign != mBlocks[0].instructions.end())
 		{
-			auto& immByte = reinterpret_cast<u8&>(mBinary.bytes()[rbpOveralign->rva + 3]);
+			auto& immByte = mBinary.bytes()[rbpOveralign->rva + 3];
 			ensure(immByte == 0xE0);
 			immByte = 0xFF;
 		}

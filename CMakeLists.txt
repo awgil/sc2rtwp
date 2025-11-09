@@ -5,7 +5,7 @@ project(sc2rtwp CXX)
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
 function(add_target TARGET_NAME TARGET_TYPE)
-	cmake_parse_arguments(PARSE_ARGV 2 ARG "STATIC_RUNTIME" "CATEGORY" "DEPS_PUBLIC;DEPS_PRIVATE;DEPS_INTERFACE")
+	cmake_parse_arguments(PARSE_ARGV 2 ARG "STATIC_RUNTIME;BARE" "CATEGORY" "DEPS_PUBLIC;DEPS_PRIVATE;DEPS_INTERFACE")
 
 	# define new target
 	if(TARGET_TYPE STREQUAL "DLL")
@@ -29,23 +29,25 @@ function(add_target TARGET_NAME TARGET_TYPE)
 	endif()
 
 	# add current directory to include path for this target and its dependencies
-	target_include_directories(${TARGET_NAME} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/${TARGET_NAME}")
+	if(NOT ARG_BARE)
+		target_include_directories(${TARGET_NAME} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/${TARGET_NAME}")
+
+		# gather sources
+		file(GLOB_RECURSE TARGET_SOURCES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" CONFIGURE_DEPENDS "src/${TARGET_NAME}/${TARGET_NAME}/*.cxx" "src/${TARGET_NAME}/${TARGET_NAME}/*.h" "src/${TARGET_NAME}/${TARGET_NAME}/*.natvis")
+		file(GLOB_RECURSE TARGET_MODULE_INTERFACES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" CONFIGURE_DEPENDS "src/${TARGET_NAME}/${TARGET_NAME}/*.ixx")
+
+		# add filtered sources to target and assign IDE source groups
+		target_sources(${TARGET_NAME}
+			PRIVATE ${TARGET_SOURCES}
+			PRIVATE FILE_SET CXX_MODULES FILES ${TARGET_MODULE_INTERFACES}
+		)
+		source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src/${TARGET_NAME}/${TARGET_NAME}" PREFIX "Sources" FILES ${TARGET_SOURCES} ${TARGET_MODULE_INTERFACES})
+	endif()
 
 	# set category, if desired
 	if(ARG_CATEGORY)
 		set_property(TARGET ${TARGET_NAME} PROPERTY FOLDER ${ARG_CATEGORY})
 	endif()
-
-	# gather sources
-	file(GLOB_RECURSE TARGET_SOURCES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" CONFIGURE_DEPENDS "src/${TARGET_NAME}/${TARGET_NAME}/*.cxx" "src/${TARGET_NAME}/${TARGET_NAME}/*.h" "src/${TARGET_NAME}/${TARGET_NAME}/*.natvis")
-	file(GLOB_RECURSE TARGET_MODULE_INTERFACES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" CONFIGURE_DEPENDS "src/${TARGET_NAME}/${TARGET_NAME}/*.ixx")
-
-	# add filtered sources to target and assign IDE source groups
-	target_sources(${TARGET_NAME}
-		PRIVATE ${TARGET_SOURCES}
-		PRIVATE FILE_SET CXX_MODULES FILES ${TARGET_MODULE_INTERFACES}
-	)
-	source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src/${TARGET_NAME}/${TARGET_NAME}" PREFIX "Sources" FILES ${TARGET_SOURCES} ${TARGET_MODULE_INTERFACES})
 
 	# add dependencies
 	target_link_libraries(${TARGET_NAME}
@@ -63,6 +65,10 @@ endfunction()
 set(capstone_DIR thirdparty/capstone/.install/lib/cmake/capstone)
 find_package(capstone)
 
+add_target(reflectcpp LIB BARE CATEGORY Third-party)
+target_include_directories(reflectcpp PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/reflect-cpp/include")
+target_sources(reflectcpp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/reflect-cpp/src/reflectcpp.cpp")
+
 add_target(common LIB DEPS_PRIVATE ntdll)
 add_target(sc2rtwp EXE_CONSOLE DEPS_PRIVATE common)
 add_target(sc2rtwp_in DLL
@@ -70,4 +76,4 @@ add_target(sc2rtwp_in DLL
 	DEPS_PRIVATE common)
 add_target(logger EXE_CONSOLE DEPS_PRIVATE common)
 add_target(test_target EXE_CONSOLE)
-add_target(unpack EXE_CONSOLE DEPS_PRIVATE common capstone::capstone_static)
+add_target(unpack EXE_CONSOLE DEPS_PRIVATE common capstone::capstone_static reflectcpp)

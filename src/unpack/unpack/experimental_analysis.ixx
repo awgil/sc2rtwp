@@ -5,7 +5,7 @@ module;
 #include <capstone/capstone.h>
 #include <cassert>
 
-export module unpack.analysis;
+export module unpack.experimental_analysis;
 
 import std;
 import common;
@@ -195,7 +195,7 @@ struct AnalysisState
 	{
 		AnalysisState res;
 		res.addressSpaces.resize(AS_Count);
-		auto [rspStart, rspEnd] = RegisterInfo::registerToRange(X86_REG_RSP);
+		auto [rspStart, rspEnd] = Register::toRange(X86_REG_RSP);
 		res.addressSpaces[AS_Register].insert({ rspStart, rspEnd, AnalysisPointer{ AS_Stack }});
 		res.addressSpaces[AS_TEB].insert({ 0x30, 0x38, AnalysisPointer{ AS_TEB } }); // NtTib.Self
 		res.addressSpaces[AS_TEB].insert({ 0x60, 0x68, AnalysisPointer{ AS_PEB } });
@@ -602,7 +602,7 @@ private:
 	{
 		assert(isn.opcount == 1 && isn.ops[0].size == 8);
 		// push x ==> sub rsp, 8 + mov [rsp], x
-		auto rsp = AnalysisPointer{ AnalysisState::AS_Register, RegisterInfo::registerToOffsetSize(X86_REG_RSP).first };
+		auto rsp = AnalysisPointer{ AnalysisState::AS_Register, Register::toOffsetSize(X86_REG_RSP).first };
 		auto rspValue = derefLoad(rsp, 8, isn.rva);
 		assert(rspValue.type == AnalysisValueType::Pointer && rspValue.value.ptr.addressSpace == AnalysisState::AS_Stack);
 		rspValue.value.ptr -= 8;
@@ -635,19 +635,19 @@ private:
 		auto callee = read(isn, isn.ops[0]);
 		// TODO: not sure what we want to do with arguments here...
 		auto& state = mExitStates[mCurrentBlockIndex];
-		auto a1 = state.addressSpaces[AnalysisState::AS_Register].find(RegisterInfo::registerToOffsetSize(X86_REG_RCX).first);
-		auto a2 = state.addressSpaces[AnalysisState::AS_Register].find(RegisterInfo::registerToOffsetSize(X86_REG_RDX).first);
-		auto a3 = state.addressSpaces[AnalysisState::AS_Register].find(RegisterInfo::registerToOffsetSize(X86_REG_R8).first);
-		auto a4 = state.addressSpaces[AnalysisState::AS_Register].find(RegisterInfo::registerToOffsetSize(X86_REG_R9).first);
-		auto argsRest = derefLoad(AnalysisPointer{ AnalysisState::AS_Register, RegisterInfo::registerToOffsetSize(X86_REG_RSP).first }, 8, isn.rva);
+		auto a1 = state.addressSpaces[AnalysisState::AS_Register].find(Register::toOffsetSize(X86_REG_RCX).first);
+		auto a2 = state.addressSpaces[AnalysisState::AS_Register].find(Register::toOffsetSize(X86_REG_RDX).first);
+		auto a3 = state.addressSpaces[AnalysisState::AS_Register].find(Register::toOffsetSize(X86_REG_R8).first);
+		auto a4 = state.addressSpaces[AnalysisState::AS_Register].find(Register::toOffsetSize(X86_REG_R9).first);
+		auto argsRest = derefLoad(AnalysisPointer{ AnalysisState::AS_Register, Register::toOffsetSize(X86_REG_RSP).first }, 8, isn.rva);
 		assert(argsRest.type == AnalysisValueType::Pointer && argsRest.value.ptr.addressSpace == AnalysisState::AS_Stack);
 		argsRest.value.ptr += 0x20;
 		// clear all volatile registers
 		// TODO: clear part of stack too? does it even matter?
-		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(RegisterInfo::registerToOffsetSize(X86_REG_RAX).first, RegisterInfo::registerToRange(X86_REG_RDX).second); // rax/rcx/rdx are contiguous
-		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(RegisterInfo::registerToOffsetSize(X86_REG_R8).first, RegisterInfo::registerToRange(X86_REG_R10).second); // r8/r9/r10 are contiguous
-		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(RegisterInfo::registerToOffsetSize(X86_REG_ZMM0).first, RegisterInfo::registerToRange(X86_REG_ZMM5).second); // xmm0-xmm5 are volatile; TODO: upper portions of xmm6-15 are too...
-		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(RegisterInfo::registerToOffsetSize(X86_REG_ZMM16).first, RegisterInfo::registerToRange(X86_REG_ZMM31).second);
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(Register::toOffsetSize(X86_REG_RAX).first, Register::toRange(X86_REG_RDX).second); // rax/rcx/rdx are contiguous
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(Register::toOffsetSize(X86_REG_R8).first, Register::toRange(X86_REG_R10).second); // r8/r9/r10 are contiguous
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(Register::toOffsetSize(X86_REG_ZMM0).first, Register::toRange(X86_REG_ZMM5).second); // xmm0-xmm5 are volatile; TODO: upper portions of xmm6-15 are too...
+		state.addressSpaces[AnalysisState::AS_Register].eraseEntries(Register::toOffsetSize(X86_REG_ZMM16).first, Register::toRange(X86_REG_ZMM31).second);
 		derefStore(regToPtr(X86_REG_RAX, 8), 8, isn.rva, addExpression(isn.rva, AnalysisExpression(8, AnalysisExpressionOp::Call, callee)));
 	}
 
@@ -659,7 +659,7 @@ private:
 
 	AnalysisPointer regToPtr(x86_reg reg, int expectedSize)
 	{
-		auto [offset, size] = RegisterInfo::registerToOffsetSize(reg);
+		auto [offset, size] = Register::toOffsetSize(reg);
 		ensure(size == expectedSize);
 		return AnalysisPointer{ AnalysisState::AS_Register, offset };
 	}
