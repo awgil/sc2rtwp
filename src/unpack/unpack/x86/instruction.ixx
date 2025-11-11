@@ -6,6 +6,7 @@ module;
 
 export module unpack.x86.instruction;
 
+export import unpack.x86.condition;
 export import unpack.x86.operand;
 
 namespace x86 {
@@ -19,6 +20,7 @@ export struct Mnem
 	struct Info
 	{
 		std::string name;
+		ConditionTest conditionCode;
 		bool isConditionalJump = false;
 	};
 
@@ -27,6 +29,7 @@ export struct Mnem
 
 	auto& info() const { return mMeta[mValue]; }
 	auto& name() const { return info().name; }
+	auto conditionCode() const { return info().conditionCode; }
 	auto isConditionalJump() const { return info().isConditionalJump; }
 
 private:
@@ -48,6 +51,24 @@ const std::array<Mnem::Info, Mnem::Count> Mnem::mMeta = []() {
 		std::ranges::transform(name, name.begin(), [](char c) { return std::tolower(c); });
 	}
 
+	// jcc/setcc conditions
+	info[X86_INS_JO].conditionCode = info[X86_INS_SETO].conditionCode = { Condition::OF, false };
+	info[X86_INS_JNO].conditionCode = info[X86_INS_SETNO].conditionCode = { Condition::OF, true };
+	info[X86_INS_JB].conditionCode = info[X86_INS_SETB].conditionCode = { Condition::CF, false };
+	info[X86_INS_JAE].conditionCode = info[X86_INS_SETAE].conditionCode = { Condition::CF, true };
+	info[X86_INS_JE].conditionCode = info[X86_INS_SETE].conditionCode = { Condition::ZF, false };
+	info[X86_INS_JNE].conditionCode = info[X86_INS_SETNE].conditionCode = { Condition::ZF, true };
+	info[X86_INS_JBE].conditionCode = info[X86_INS_SETBE].conditionCode = { Condition::CZ, false };
+	info[X86_INS_JA].conditionCode = info[X86_INS_SETA].conditionCode = { Condition::CZ, true };
+	info[X86_INS_JS].conditionCode = info[X86_INS_SETS].conditionCode = { Condition::SF, false };
+	info[X86_INS_JNS].conditionCode = info[X86_INS_SETNS].conditionCode = { Condition::SF, true };
+	info[X86_INS_JP].conditionCode = info[X86_INS_SETP].conditionCode = { Condition::PF, false };
+	info[X86_INS_JNP].conditionCode = info[X86_INS_SETNP].conditionCode = { Condition::PF, true };
+	info[X86_INS_JL].conditionCode = info[X86_INS_SETL].conditionCode = { Condition::SO, false };
+	info[X86_INS_JGE].conditionCode = info[X86_INS_SETGE].conditionCode = { Condition::SO, true };
+	info[X86_INS_JLE].conditionCode = info[X86_INS_SETLE].conditionCode = { Condition::LE, false };
+	info[X86_INS_JG].conditionCode = info[X86_INS_SETG].conditionCode = { Condition::LE, true };
+
 	// conditional jumps
 	for (auto ins : { X86_INS_JO, X86_INS_JNO, X86_INS_JB, X86_INS_JAE, X86_INS_JE, X86_INS_JNE, X86_INS_JBE, X86_INS_JA,
 		X86_INS_JS, X86_INS_JNS, X86_INS_JP, X86_INS_JNP, X86_INS_JL, X86_INS_JGE, X86_INS_JLE, X86_INS_JG,
@@ -67,6 +88,7 @@ export struct Instruction
 	u8 opcount;
 	std::array<Operand, 4> ops;
 
+	i32 endRVA() const { return rva + length; }
 	auto operands(this auto&& self) { return std::span{ self.ops.data(), self.opcount }; }
 };
 

@@ -34,6 +34,7 @@ public:
 	void clear() { mEntries.clear(); }
 	auto& operator[](size_t i) { return mEntries[i]; }
 	auto& operator[](size_t i) const { return mEntries[i]; }
+	auto reserve(size_t size) { mEntries.reserve(size); }
 
 	// return mutable reference to the entry iterator points to; note that begin/end should not be modified, to ensure invariant is preserved
 	auto& edit(auto iter) { return mEntries[iter - begin()]; }

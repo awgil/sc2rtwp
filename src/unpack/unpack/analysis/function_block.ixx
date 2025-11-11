@@ -10,49 +10,82 @@ export struct FunctionBlock : RangeMapEntry<i32>
 	i32 insBegin; // index of the first instruction belonging to this block
 	i32 insEnd; // index of the first instruction after this block
 	SmallVector<i32, 2> successors; // indices of successor blocks
+
+	auto insCount() const { return insEnd - insBegin; }
 };
 
 export struct Function
 {
 	std::vector<x86::Instruction> instructions; // sorted by rva
 	RangeMap<FunctionBlock> blocks;
+
+	auto blockInstructions(this auto&& self, const FunctionBlock& block) { return std::span(self.instructions).subspan(block.insBegin, block.insCount()); }
+	auto blockInstructions(this auto&& self, int blockIndex) { return self.blockInstructions(self.blocks[blockIndex]); }
 };
 
 // debug logging
 enum class LogLevel { None, Important, Verbose };
-constexpr LogLevel gLogLevel = LogLevel::None;
-
-template<typename... Args>
-void log(LogLevel level, std::format_string<Args...> fmt, Args&&... args)
-{
-	if (level > gLogLevel)
-		return;
-	std::print("[FuncBlock] ");
-	std::println(fmt, std::forward<Args>(args)...);
-}
-
-void log(LogLevel level, const x86::Instruction& ins, std::string_view message) { log(level, ">> {:X}: {} = {}", ins.rva, ins, message); }
+Logger log{ "FuncBlock", LogLevel::None };
+void logIns(LogLevel level, const x86::Instruction& ins, std::string_view message) { log(level, ">> {:X}: {} = {}", ins.rva, ins, message); }
 
 // utility for finding all blocks in a function
 // consider reusing the instance of this class for analyzing multiple functions, to save on some allocations
 export class FunctionBlockAnalysis
 {
 public:
-	Function analyze(std::span<const u8> bytes, i32 start, i32 limit)
+	FunctionBlockAnalysis(std::span<const u8> bytes) : mBytes(bytes) {}
+
+	// the standard entry point: perform full analysis
+	// limit is optional, zero means 'unknown, function can extend up to the end of the binary'
+	Function analyze(i32 rva, i32 limit = 0)
 	{
-		mBytes = bytes;
-		mCurStart = start;
-		mCurLimit = limit;
+		start(rva, limit);
+		scheduleAndAnalyze(rva);
+		return finish();
+	}
+
+	// observe current analysis state
+	bool inProgress() const { return mCurStart != 0; }
+	auto& currentBlocks() { return mBlocks; }
+	auto& currentInstructions() { return mInstructions; }
+	std::span<x86::Instruction> instructions(const FunctionBlock& block) { return std::span(mInstructions).subspan(block.insBegin, block.insCount()); }
+
+	// cancel any current incremental analysis
+	void clear()
+	{
+		mCurStart = mCurLimit = 0;
+		mInstructions.clear();
+		mBlocks.clear();
+		mPendingBlockStarts.clear();
+	}
+
+	// start new incremental analysis
+	// useful if there are some blocks that are normally unreachable but we still want them to be considered part of the function
+	void start(i32 rva, i32 limit = 0)
+	{
+		ensure(!inProgress());
+		mCurStart = rva;
+		mCurLimit = limit ? limit : static_cast<i32>(mBytes.size());
 		log(LogLevel::Important, "analyzing {:X}-{:X}", mCurStart, mCurLimit);
-		mPendingBlockStarts.push_back(start);
+	}
+
+	// analyze block starting at specified address and all blocks it refers to
+	void scheduleAndAnalyze(i32 rva)
+	{
+		ensure(inProgress());
+		mPendingBlockStarts.push_back(rva);
 		while (!mPendingBlockStarts.empty())
 		{
 			auto rva = mPendingBlockStarts.back();
 			mPendingBlockStarts.pop_back();
 			analyzeBlock(rva);
 		}
+	}
 
-		// ok, now fix up data
+	// finish the analysis, get results and clear internal state
+	Function finish()
+	{
+		ensure(inProgress());
 		Function result;
 		result.instructions.reserve(mInstructions.size());
 		for (auto& block : mBlocks)
@@ -64,8 +97,8 @@ public:
 			for (auto& succ : block.successors)
 				succ = mBlocks.findIndex(succ);
 		}
-		mInstructions.clear();
 		result.blocks = std::move(mBlocks);
+		clear();
 		return result;
 	}
 
@@ -109,18 +142,18 @@ private:
 			newBlock.end += ins.length;
 			if (ins.mnem == X86_INS_RET || ins.mnem == X86_INS_INT && ins.ops[0] == 0x29)
 			{
-				log(LogLevel::Verbose, ins, "ret");
+				logIns(LogLevel::Verbose, ins, "ret");
 				break; // ret or int 0x29 end the final blocks of the function
 			}
 			else if (ins.mnem == X86_INS_JMP)
 			{
-				log(LogLevel::Verbose, ins, "jmp");
+				logIns(LogLevel::Verbose, ins, "jmp");
 				processJump(newBlock, ins);
 				break; // unconditional jump ends the block
 			}
 			else if (ins.mnem.isConditionalJump())
 			{
-				log(LogLevel::Verbose, ins, "jcc");
+				logIns(LogLevel::Verbose, ins, "jcc");
 				newBlock.successors.push_back(newBlock.end); // implicit flow edge should be first (before conditional jump)
 				processJump(newBlock, ins);
 				mPendingBlockStarts.push_back(newBlock.end); // process flow edge first...
@@ -129,13 +162,13 @@ private:
 			else if (newBlock.end == limit)
 			{
 				// we've reached a point where someone else jumped to, end the block now
-				log(LogLevel::Verbose, ins, "limit reached");
+				logIns(LogLevel::Verbose, ins, "limit reached");
 				newBlock.successors.push_back(newBlock.end);
 				break;
 			}
 			else
 			{
-				log(LogLevel::Verbose, ins, "flow");
+				logIns(LogLevel::Verbose, ins, "flow");
 				ensure(newBlock.end < limit);
 				// continue...
 			}
@@ -166,13 +199,8 @@ private:
 		}
 	}
 
-	std::span<x86::Instruction> instructions(const FunctionBlock& block)
-	{
-		return std::span(mInstructions).subspan(block.insBegin, block.insEnd - block.insBegin);
-	}
-
 private:
-	std::span<const u8> mBytes{};
+	std::span<const u8> mBytes;
 	i32 mCurStart{};
 	i32 mCurLimit{};
 	std::vector<x86::Instruction> mInstructions;

@@ -7,7 +7,9 @@ import unpack.pe_binary;
 import unpack.function;
 import unpack.known_structs;
 
-import unpack.analysis.function_block;
+import unpack.patcher;
+import unpack.function_table;
+import unpack.analysis.simple_refs;
 
 template<typename T, typename F> constexpr size_t fieldOffset(F (T::*f))
 {
@@ -15,20 +17,30 @@ template<typename T, typename F> constexpr size_t fieldOffset(F (T::*f))
 	return reinterpret_cast<size_t>(&pm);
 }
 
+// executable sections that we care about
+enum class Section { Text, RData, Data };
+
 // address of some entity in the executable
 // initially it's location is unknown; when we discover first reference, we save the RVA - and then validate that all other references match
-class ResolvedAddress
+template<Section S> class ResolvedAddress
 {
 public:
+	static constexpr Section Section = S;
+
 	bool resolved() const { return mRVA; }
 	auto address() const { ensure(resolved()); return mRVA; }
 
-	void resolve(rva_t rva)
+	void resolve(rva_t rva, PEBinary& bin)
 	{
 		if (!mRVA)
+		{
+			ensure(bin.sections()[static_cast<int>(S)].contains(rva));
 			mRVA = rva;
+		}
 		else
+		{
 			ensure(mRVA == rva);
+		}
 	}
 
 private:
@@ -36,10 +48,10 @@ private:
 };
 
 // address of a global structure; resolved by field accesses
-template<typename T> class ResolvedGlobalAddress : public ResolvedAddress
+template<typename T, Section S> class ResolvedGlobalAddress : public ResolvedAddress<S>
 {
 public:
-	T* access(PEBinary& bin) const { return bin.structAtRVA<T>(address()); }
+	T* access(PEBinary& bin) const { return bin.structAtRVA<T>(this->address()); }
 };
 
 template<typename T> T getSimpleXorConstant(PEBinary& bin, const FunctionInfo& func, const FunctionInfo::Reference& ref)
@@ -129,7 +141,6 @@ private:
 	std::string_view mDebugName; // printed when it's resolved
 };
 
-// TODO: process exports, reloc table (to find function addresses in vtables etc), SEH (handler/filter ptrs + function bounds)
 // TODO: RTTI?
 class SC2Binary
 {
@@ -137,19 +148,18 @@ public:
 	SC2Binary(const std::string& path, bool applyRuntimePatches)
 		: mApplyRuntimePatches(applyRuntimePatches)
 		, mBinary(path.c_str())
-		, mSectionText(mBinary.sections().getByName(".text"))
-		, mSectionRData(mBinary.sections().getByName(".rdata"))
-		, mSectionData(mBinary.sections().getByName(".data"))
+		, mPatcher(mBinary, true, applyRuntimePatches)
 		, mFuncs(mBinary)
+		, mFuncTable(mBinary, sectionText(), mPatcher)
 	{
-		ensure(&mSectionText - &*mBinary.sections().begin() == 0);
-		ensure(&mSectionRData - &*mBinary.sections().begin() == 1);
-		ensure(&mSectionData - &*mBinary.sections().begin() == 2);
+		ensure(sectionText().name == ".text");
+		ensure(sectionRData().name == ".rdata");
+		ensure(sectionData().name == ".data");
 
 		// note on relocs: SC2 binary has 0 relocs in .text section, which makes sense (there's stuff in vtables etc that needs to be relocated, code uses rip relative addressing modes everywhere...)
 		// this means we can completely skip emulating all the manual relocation logic in decompressor
 		for (auto reloc : mBinary.relocRVAs())
-			ensure(!mSectionText.contains(reloc));
+			ensure(!sectionText().contains(reloc));
 
 		processBootstrapStart();
 		processTLSCallbacks();
@@ -161,20 +171,28 @@ private:
 	// process fallback start function
 	void processBootstrapStart()
 	{
-		auto fsec = mBinary.findSEHEntry(mBinary.entryPoint());
-		auto fb = analysis::FunctionBlockAnalysis().analyze(mBinary.bytes(), mBinary.entryPoint(), fsec->end);
+		// note: bootstrap function is noreturn, and the very last block containing 'normal' return is unreachable
+		auto& func = mFuncTable.analyze(mBinary.entryPoint(), "bootstrapStart", [](auto& analyzer, rva_t start, rva_t limit) {
+			analyzer.start(start, limit);
+			analyzer.scheduleAndAnalyze(start);
+			analyzer.scheduleAndAnalyze(analyzer.currentBlocks().back().end);
+			return analyzer.finish();
+		});
 
-		auto& start = mFuncs.process(mBinary.entryPoint(), "bootstrapStart");
-		matchDataFieldRefs(start, &BootstrapStartState::stage);
-		matchTextReferences(start);
-		ensure(mBSS.address() - mSectionData.begin == 0x60); // not sure what's there before it and how likely is it to change...
+		// we don't care about rdata refs here, these are error messages
+		resolveRefs(analysis::getSimpleRefs(func.instructions) | std::views::filter([&](const auto& r) { return !sectionRData().contains(r.ref); }),
+			&BootstrapStartState::stage);
+		ensure(mBSS.address() - sectionData().begin == 0x60); // not sure what's there before it and how likely is it to change...
 	}
 
+	// *** start legacy ***
 	// process TLS callbacks that do the actual decoding
 	void processTLSCallbacks()
 	{
 		// note: tls directory is in .rdata, just preceding RTTI data...
 		ensure(mBinary.tlsCallbackRVAs().size() == 1);
+		auto& func = mFuncTable.analyze(mBinary.tlsCallbackRVAs().front(), "bootstrapTLSInitial");
+
 		auto& tlsInitial = mFuncs.process(mBinary.tlsCallbackRVAs().front(), "bootstrapTLSInitial");
 		matchDataFieldRefs(tlsInitial,
 			&BootstrapStartState::stage,
@@ -183,7 +201,7 @@ private:
 			&AntitamperStaticState::pageHashUsesAVX2); // last flag
 		matchTextReferences(tlsInitial, mTLSRuntime, mTLSDecode, mTLSFixup);
 		// note: RTTI between tls directory and antidebug static ?..
-		
+
 		if (mApplyRuntimePatches)
 		{
 			// keep xor constants as zeros: skip the loop
@@ -225,9 +243,9 @@ private:
 		processEmptyFunc(iRef->refRVA, "bootstrapAnyModuleLoaded");
 		decodeBootstrapInfo(tlsDecodeImpl, imagebaseReg, iRef++->insnRVA);
 
-		ResolvedAddress remapSections, remapSectionsEnd;
-		remapSectionsEnd.resolve(iRef++->refRVA);
-		remapSections.resolve(iRef++->refRVA);
+		ResolvedAddress<Section::Text> remapSections, remapSectionsEnd;
+		remapSectionsEnd.resolve(iRef++->refRVA, mBinary);
+		remapSections.resolve(iRef++->refRVA, mBinary);
 		ensure(remapSectionsEnd.address() > remapSections.address());
 		processEmptyFunc(remapSections.address(), "bootstrapRemapSections");
 
@@ -268,9 +286,9 @@ private:
 		matchDataFieldRef(tlsDecodeImpl, *iRef++, &AntitamperStaticState::writableSectionMapping);
 		matchDataFieldRef(tlsDecodeImpl, *iRef++, &AntitamperStaticState::vehDecryptionDone);
 		matchDataFieldRef(tlsDecodeImpl, *iRef++, &AntitamperStaticState::vehDecryptionFailed);
-		ensure(mSectionText.contains(iRef++->refRVA)); // ??? some sort of failure handler, looks encrypted, or just junk?..
+		ensure(sectionText().contains(iRef++->refRVA)); // ??? some sort of failure handler, looks encrypted, or just junk?..
 		matchDataFieldRef(tlsDecodeImpl, *iRef++, &AntitamperStaticState::vehDecryptionDone);
-		mObfuscate.resolve(iRef++->refRVA);
+		mObfuscate.resolve(iRef++->refRVA, mBinary);
 		imagebaseReg = matchImagebaseLoad(tlsDecodeImpl, *iRef++); // used for reading xor constants
 		matchDataFieldRef(tlsDecodeImpl, *iRef++, mXorVirtualAlloc.field());
 
@@ -302,7 +320,7 @@ private:
 		auto skipUninteresting = [&]() {
 			while (iRef->refRVA == 0 || iRef->refRVA == mObfuscate.address() ||
 				iRef->refRVA >= mASS.address() + fieldOffset(&AntitamperStaticState::xorConstants) && iRef->refRVA < mASS.address() + fieldOffset(&AntitamperStaticState::delayedCrashEncodedState) ||
-				mSectionRData.contains(iRef->refRVA))
+				sectionRData().contains(iRef->refRVA))
 			{
 				++iRef;
 			}
@@ -319,9 +337,9 @@ private:
 		processDecryptImports(iRef++->refRVA);
 
 		ensure(iRef++->refRVA == mBSS.address() + fieldOffset(&BootstrapStartState::encryptedInfo) + fieldOffset(&BootstrapInfo::pageRegions));
-		mUnencryptedStart.resolve(iRef++->refRVA);
-		mUnencryptedEnd.resolve(iRef++->refRVA);
-		ensure(mUnencryptedStart.address() == mSectionText.begin && mSectionText.contains(mUnencryptedEnd.address()));
+		mUnencryptedStart.resolve(iRef++->refRVA, mBinary);
+		mUnencryptedEnd.resolve(iRef++->refRVA, mBinary);
+		ensure(mUnencryptedStart.address() == sectionText().begin && sectionText().contains(mUnencryptedEnd.address()));
 		matchDataFieldRef(tlsDecodeImpl, *iRef++, &BootstrapStartState::stage); // enter stage D
 
 		skipUninteresting();
@@ -333,15 +351,15 @@ private:
 		ensure(iRef++->refRVA == decryptPage12);
 		skipUninteresting();
 		processDecryptPage(iRef++->refRVA, "Var0");
-		mUnencryptedEnd.resolve(iRef++->refRVA);
-		mUnencryptedStart.resolve(iRef++->refRVA);
+		mUnencryptedEnd.resolve(iRef++->refRVA, mBinary);
+		mUnencryptedStart.resolve(iRef++->refRVA, mBinary);
 		decodePages();
 		processLeafFunc(iRef++->refRVA, "bootstrapProcessNewThread");
 
 		// copy expected remapped section state
-		mRemappedSegmentState.resolve(iRef++->refRVA);
-		mRemappedSegmentCount.resolve(iRef++->refRVA);
-		ensure(mSectionText.contains(mRemappedSegmentState.address()) && mSectionText.contains(mRemappedSegmentCount.address()));
+		mRemappedSegmentState.resolve(iRef++->refRVA, mBinary);
+		mRemappedSegmentCount.resolve(iRef++->refRVA, mBinary);
+		ensure(sectionText().contains(mRemappedSegmentState.address()) && sectionText().contains(mRemappedSegmentCount.address()));
 		// TODO: nop out next loop, which random-fills the state array
 		ensure(iRef++->refRVA == mBSS.address() + fieldOffset(&BootstrapStartState::encryptedInfo) + fieldOffset(&BootstrapInfo::sections));
 		skipUninteresting();
@@ -451,8 +469,8 @@ private:
 		// bootstrap region rehash logic is repeated in a few functions
 		if (index == 1 || index == 2 || index == 5 || index == 8 || index == 10)
 		{
-			mVEHHashRegionEnd.resolve(iRef++->refRVA);
-			mVEHHashRegionStart.resolve(iRef++->refRVA);
+			mVEHHashRegionEnd.resolve(iRef++->refRVA, mBinary);
+			mVEHHashRegionStart.resolve(iRef++->refRVA, mBinary);
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::bootstrapRegionHash);
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::bootstrapRegionHash);
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::bootstrapRegionHashMismatch);
@@ -462,8 +480,8 @@ private:
 		// some weird hashing logic, the hash result is not actually used anywhere...
 		if (index == 3 || index == 7 || index == 12 || index == 13 || index == 15)
 		{
-			ensure(mSectionText.contains(iRef++->refRVA));
-			ensure(mSectionText.contains(iRef++->refRVA));
+			ensure(sectionText().contains(iRef++->refRVA));
+			ensure(sectionText().contains(iRef++->refRVA));
 		}
 
 		// index-specific field access
@@ -492,20 +510,20 @@ private:
 		if (index == 14)
 		{
 			// TODO: do full constant propagation logic, both for base RVA and polynomial constants
-			ensure(mSectionText.contains(iRef++->refRVA)); // after adjustment: base RVA containing encrypted versions of obfuscate
+			ensure(sectionText().contains(iRef++->refRVA)); // after adjustment: base RVA containing encrypted versions of obfuscate
 			auto decodeLoopAddr = iRef->insnRVA;
-			mObfuscate.resolve(iRef++->refRVA); // RVA of obfuscate - note that it might be offset by a constant!
+			mObfuscate.resolve(iRef++->refRVA, mBinary); // RVA of obfuscate - note that it might be offset by a constant!
 			ensure(iRef++->refRVA == 0); // imagebase used for VA->RVA conversion...
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::writableSectionMapping);
-			ensure(mSectionRData.contains(iRef++->refRVA)); // gCodeSection.ptr
-			ensure(mSectionRData.contains(iRef++->refRVA)); // gCodeSection.size
+			ensure(sectionRData().contains(iRef++->refRVA)); // gCodeSection.ptr
+			ensure(sectionRData().contains(iRef++->refRVA)); // gCodeSection.size
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::writableSectionMapping);
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::vehDecryptionDone); // TODO: store constant?..
-			if (mSectionText.contains(iRef->refRVA))
+			if (sectionText().contains(iRef->refRVA))
 			{
 				// sometimes compiler might reload address of obfuscate function here, and now it seems to be done directly without adjustment...
 				mObfuscate = {};
-				mObfuscate.resolve(iRef++->refRVA);
+				mObfuscate.resolve(iRef++->refRVA, mBinary);
 			}
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::xorConstants);
 			matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::obfuscateFunctionHash);
@@ -534,7 +552,7 @@ private:
 		ensure(iRef++->refRVA == numCallsRVA);
 		matchDataFieldRef(vehSub, *iRef++, &AntitamperStaticState::bootstrapRegionHashMismatch);
 		matchDataFieldRef(vehSub, *iRef++, mXorVEHLastExcInfo.field());
-		mVEHContinuationFail.resolve(iRef++->refRVA);
+		mVEHContinuationFail.resolve(iRef++->refRVA, mBinary);
 		matchDataFieldRef(vehSub, *iRef++, mXorVEHLastExcInfo.field());
 		matchDataFieldRef(vehSub, *iRef++, mXorVEHRetval.field());
 		ensure(iRef++->refRVA == numCallsRVA);
@@ -544,7 +562,7 @@ private:
 
 	void processInitADS(rva_t rva)
 	{
-		ensure(mSectionText.contains(rva));
+		ensure(sectionText().contains(rva));
 		auto& func = mFuncs.process(rva, "bootstrapInitAntitamperDynamicState");
 		matchTextReferences(func, mObfuscate, mTLSRuntime);
 		// data refs are not interesting, to xor constants and then to a bunch of functions
@@ -553,20 +571,20 @@ private:
 
 	void processDecryptImports(rva_t rva)
 	{
-		ensure(mSectionText.contains(rva));
+		ensure(sectionText().contains(rva));
 		auto& func = mFuncs.process(rva, "bootstrapDecryptImports");
 
 		auto iRef = func.refs().begin();
-		mShuffle.resolve(iRef++->refRVA);
+		mShuffle.resolve(iRef++->refRVA, mBinary);
 		matchDataFieldRef(func, *iRef++, &AntitamperStaticState::failedImportLibName);
-		mShuffle.resolve(iRef++->refRVA);
+		mShuffle.resolve(iRef++->refRVA, mBinary);
 		matchDataFieldRef(func, *iRef++, &AntitamperStaticState::failedImportFuncName);
 		matchDataFieldRef(func, *iRef++, &AntitamperStaticState::failedImportLibName);
-		mImportFail.resolve(iRef++->refRVA);
+		mImportFail.resolve(iRef++->refRVA, mBinary);
 		ensure(iRef == func.refs().end());
 
-		ensure(mSectionRData.contains(mShuffle.address()));
-		ensure(mSectionText.contains(mImportFail.address()));
+		ensure(sectionRData().contains(mShuffle.address()));
+		ensure(sectionText().contains(mImportFail.address()));
 
 		decodeImports();
 
@@ -610,31 +628,31 @@ private:
 
 		auto iRef = func.refs().begin();
 		matchDataFieldRef(func, *iRef++, &AntitamperStaticState::dynState);
-		mObfuscate.resolve(iRef++->refRVA);
+		mObfuscate.resolve(iRef++->refRVA, mBinary);
 		matchDataFieldRef(func, *iRef++, &AntitamperStaticState::xorConstants);
 		matchDataFieldRef(func, *iRef++, &AntitamperStaticState::tlsDecryptionDone);
 		processEmptyFunc(iRef++->refRVA, "bootstrapTLSDummy"); // replace 2nd & 3rd tls callbacks with dummy func
 		ensure(iRef++->refRVA == mBSS.address() + fieldOffset(&BootstrapStartState::encryptedInfo) + fieldOffset(&BootstrapInfo::rvaEntryPoint)); // read real entrypoint
 		ensure(iRef++->refRVA == mBSS.address() + fieldOffset(&BootstrapStartState::encryptedInfo) + fieldOffset(&BootstrapInfo::rvaEntryPoint)); // patch with random stuff (TODO: nop out the loop)
 		// the next code overwrites the entire bootstrap section with random stuff; TODO reconsider...
-		mVEHHashRegionStart.resolve(iRef++->refRVA);
-		mVEHHashRegionEnd.resolve(iRef++->refRVA);
+		mVEHHashRegionStart.resolve(iRef++->refRVA, mBinary);
+		mVEHHashRegionEnd.resolve(iRef++->refRVA, mBinary);
 		ensure(iRef++->refRVA == mBinary.entryPoint()); // patching out the entrypoint to jump to real one
 		ensure(iRef == func.refs().end());
 	}
 
 	void processEmptyFunc(rva_t rva, std::string_view name)
 	{
-		ensure(mSectionText.contains(rva));
+		ensure(sectionText().contains(rva));
 		auto& func = mFuncs.process(rva, name);
 		ensure(func.refs().empty());
 	}
 
 	FunctionInfo& processLeafFunc(rva_t rva, std::string_view name)
 	{
-		ensure(mSectionText.contains(rva));
+		ensure(sectionText().contains(rva));
 		auto& func = mFuncs.process(rva, name);
-		ensure(std::ranges::all_of(func.refsToSection(mSectionText), [&](const auto& ref) { return ref.refRVA == mObfuscate.address(); }));
+		ensure(std::ranges::all_of(func.refsToSection(sectionText()), [&](const auto& ref) { return ref.refRVA == mObfuscate.address(); }));
 		return func;
 	}
 
@@ -643,7 +661,7 @@ private:
 	{
 		auto& wrapper = mFuncs.process(wrapperRVA, name);
 		matchDataFieldRefs(wrapper, std::forward<Fields>(dataRefs)...);
-		ResolvedAddress implAddr;
+		ResolvedAddress<Section::Text> implAddr;
 		matchTextReferences(wrapper, implAddr);
 
 		return mFuncs.process(implAddr.address(), name + "Impl");
@@ -654,8 +672,8 @@ private:
 	void decodeBootstrapInfo(const FunctionInfo& func, x86_reg imagebaseReg, rva_t lookupStartRVA)
 	{
 		auto shuffleRef = findNextIndirectReference(func, imagebaseReg, lookupStartRVA);
-		ensure(mSectionRData.contains(shuffleRef.refRVA));
-		mShuffle.resolve(shuffleRef.refRVA);
+		ensure(sectionRData().contains(shuffleRef.refRVA));
+		mShuffle.resolve(shuffleRef.refRVA, mBinary);
 		auto shuffle = &mBinary.bytes()[shuffleRef.refRVA];
 
 		auto infoRef = findNextIndirectReference(func, imagebaseReg, shuffleRef.insnRVA);
@@ -711,7 +729,7 @@ private:
 
 		u32 importDirectoryTableOffset = mBinary.peHeader().OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
 		simpleDecode(importDirectoryTableOffset);
-		ensure(mSectionRData.contains(importDirectoryTableOffset));
+		ensure(sectionRData().contains(importDirectoryTableOffset));
 
 		SimpleRangeMap<rva_t> iat;
 
@@ -719,7 +737,7 @@ private:
 		for (auto entry = mBinary.structAtRVA<IMAGE_IMPORT_DESCRIPTOR>(importDirectoryTableOffset); entry->Characteristics; ++entry, ++numDescriptors)
 		{
 			simpleDecode(*entry);
-			ensure(mSectionRData.contains(entry->OriginalFirstThunk) && mSectionRData.contains(entry->Name) && mSectionRData.contains(entry->FirstThunk));
+			ensure(sectionRData().contains(entry->OriginalFirstThunk) && sectionRData().contains(entry->Name) && sectionRData().contains(entry->FirstThunk));
 
 			auto libName = mBinary.structAtRVA<char>(entry->Name);
 			decodeString(libName);
@@ -735,7 +753,7 @@ private:
 				if ((*curImport >> 63) == 0)
 				{
 					// import by name
-					ensure(mSectionRData.contains(*curImport));
+					ensure(sectionRData().contains(*curImport));
 					auto funcName = mBinary.structAtRVA<char>(*curImport + 2);
 					decodeString(funcName);
 					//std::println(">> Function {}", funcName);
@@ -762,7 +780,7 @@ private:
 	void decodePages()
 	{
 		auto& info = mBSS.access(mBinary)->encryptedInfo.pageRegions;
-		ensure(info[0].rva == mSectionText.begin && info[0].size == mSectionText.end - mSectionText.begin);
+		ensure(info[0].rva == sectionText().begin && info[0].size == sectionText().end - sectionText().begin);
 		ensure(info[1].rva == 0); // note: second region would use slightly different decryption function, i didn't reverse it
 
 		i64 prevPageFNV1 = 0;
@@ -811,18 +829,18 @@ private:
 	template<typename... R>
 	void matchTextReferences(const FunctionInfo& func, R&... refs)
 	{
-		auto range = func.refsToSection(mSectionText);
+		auto range = func.refsToSection(sectionText());
 		auto it = range.begin();
-		(refs.resolve(it++->refRVA), ...);
+		(refs.resolve(it++->refRVA, mBinary), ...);
 		ensure(it == range.end());
 	}
 
 	template<typename... R>
 	void matchNonCallTextReferences(const FunctionInfo& func, R&... refs)
 	{
-		auto range = func.refsToSection(mSectionText) | std::ranges::views::filter([](const auto& ref) { return ref.type != FunctionInfo::ReferenceType::Call; });
+		auto range = func.refsToSection(sectionText()) | std::ranges::views::filter([](const auto& ref) { return ref.type != FunctionInfo::ReferenceType::Call; });
 		auto it = range.begin();
-		(refs.resolve(it++->refRVA), ...);
+		(refs.resolve(it++->refRVA, mBinary), ...);
 		ensure(it == range.end());
 	}
 
@@ -830,7 +848,7 @@ private:
 	template<typename... Fields>
 	void matchDataFieldRefs(const FunctionInfo& func, Fields&&... fields)
 	{
-		auto range = func.refsToSection(mSectionData);
+		auto range = func.refsToSection(sectionData());
 		auto it = range.begin();
 		(matchDataFieldRef(func, *it++, fields), ...);
 		ensure(it == range.end());
@@ -838,9 +856,7 @@ private:
 
 	template<typename Field> void matchDataFieldRef(const FunctionInfo& func, const FunctionInfo::Reference& ref, Field&& field)
 	{
-		auto offset = fieldOffset(field);
-		ensure(ref.refRVA >= mSectionData.begin + offset);
-		fieldResolver(field).resolve(ref.refRVA - offset);
+		fieldResolver(field).resolve(ref.refRVA - fieldOffset(field), mBinary);
 	}
 
 	template<typename C, typename T> void matchDataFieldRef(const FunctionInfo& func, const FunctionInfo::Reference& ref, XorredField<T, C>& field)
@@ -851,9 +867,7 @@ private:
 
 	template<typename Field> void matchRDataFieldRef(const FunctionInfo& func, const FunctionInfo::Reference& ref, Field&& field)
 	{
-		auto offset = fieldOffset(field);
-		ensure(ref.refRVA >= mSectionRData.begin + offset);
-		fieldResolver(field).resolve(ref.refRVA - offset);
+		fieldResolver(field).resolve(ref.refRVA - fieldOffset(field), mBinary);
 	}
 
 	// match lea reg, imagebase ref
@@ -897,25 +911,6 @@ private:
 			iIsn = iBlock->instructions.begin();
 		}
 		return {};
-	}
-
-	template<typename T> ResolvedGlobalAddress<BootstrapStartState>& fieldResolver(T(BootstrapStartState::*)) { return mBSS; }
-	template<typename T> ResolvedGlobalAddress<AntitamperStaticState>& fieldResolver(T(AntitamperStaticState::*)) { return mASS; }
-	template<typename T> ResolvedGlobalAddress<MappedRegions>& fieldResolver(T(MappedRegions::*)) { return mMR; }
-
-	void dumpRefs(const FunctionInfo& func)
-	{
-		for (auto& ref : func.refs())
-		{
-			if (ref.refRVA >= mBSS.address() && ref.refRVA < mBSS.address() + sizeof(BootstrapStartState))
-				std::println("{:X} > BSS + 0x{:X}", ref.insnRVA, ref.refRVA - mBSS.address());
-			else if (ref.refRVA >= mASS.address() && ref.refRVA < mASS.address() + sizeof(AntitamperStaticState))
-				std::println("{:X} > ASS + 0x{:X}", ref.insnRVA, ref.refRVA - mASS.address());
-			else if (ref.refRVA >= mMR.address() && ref.refRVA < mMR.address() + sizeof(MappedRegions))
-				std::println("{:X} > MR + 0x{:X}", ref.insnRVA, ref.refRVA - mMR.address());
-			else
-				std::println("{:X} > {}", ref.insnRVA, mBinary.formatRVA(ref.refRVA));
-		}
 	}
 
 	template<typename Span>
@@ -982,19 +977,59 @@ private:
 			std::println("Failed to patch jump at {:X}: {:02X}", rva, address[0]);
 		}
 	}
+	// *** end legacy ***
+
+	// new stuff ...
+	const PEBinary::Section& section(Section id) { return mBinary.sections()[static_cast<int>(id)]; }
+	const PEBinary::Section& sectionText() { return section(Section::Text); }
+	const PEBinary::Section& sectionRData() { return section(Section::RData); }
+	const PEBinary::Section& sectionData() { return section(Section::Data); }
+
+	template<typename T> auto& fieldResolver(T (BootstrapStartState::*)) { return mBSS; }
+	template<typename T> auto& fieldResolver(T (AntitamperStaticState::*)) { return mASS; }
+	template<typename T> auto& fieldResolver(T (MappedRegions::*)) { return mMR; }
+
+	void resolveRefs(auto&& refs, auto&&... resolvers)
+	{
+		auto it = std::ranges::begin(refs);
+		auto end = std::ranges::end(refs);
+		((ensure(it != end), resolveRef(*it++, std::forward<decltype(resolvers)>(resolvers))), ...);
+		ensure(it == end);
+	}
+
+	template<typename T, typename R>
+	void resolveRef(const analysis::Reference& ref, R (T::*field)) { fieldResolver(field).resolve(ref.ref - fieldOffset(field), mBinary); }
+
+	template<Section S>
+	void resolveRef(const analysis::Reference& ref, ResolvedAddress<S>& addr) { addr.resolve(ref.ref, mBinary); }
+
+	void dumpRefs(auto&& refs)
+	{
+		for (auto& r : refs)
+		{
+			if (mBSS.resolved() && r.ref >= mBSS.address() && r.ref < mBSS.address() + sizeof(BootstrapStartState))
+				std::println("{:X} > BSS + 0x{:X} [{}]", r.ins->rva, r.ref - mBSS.address(), *r.ins);
+			else if (mASS.resolved() && r.ref >= mASS.address() && r.ref < mASS.address() + sizeof(AntitamperStaticState))
+				std::println("{:X} > ASS + 0x{:X} [{}]", r.ins->rva, r.ref - mASS.address(), *r.ins);
+			else if (mMR.resolved() && r.ref >= mMR.address() && r.ref < mMR.address() + sizeof(MappedRegions))
+				std::println("{:X} > MR + 0x{:X} [{}]", r.ins->rva, r.ref - mMR.address(), *r.ins);
+			else
+				std::println("{:X} > {} [{}]", r.ins->rva, mBinary.formatRVA(r.ref), *r.ins);
+		}
+	}
+
 
 private:
 	bool mApplyRuntimePatches;
 	PEBinary mBinary;
-	const PEBinary::Section& mSectionText;
-	const PEBinary::Section& mSectionRData;
-	const PEBinary::Section& mSectionData;
-	FunctionTable mFuncs;
+	Patcher mPatcher;
+	OldFunctionTable mFuncs;
+	FunctionTable mFuncTable;
 
-	ResolvedGlobalAddress<BootstrapStartState> mBSS;
-	ResolvedGlobalAddress<AntitamperStaticState> mASS;
-	ResolvedGlobalAddress<MappedRegions> mMR;
-	ResolvedAddress mShuffle;
+	ResolvedGlobalAddress<BootstrapStartState, Section::Data> mBSS;
+	ResolvedGlobalAddress<AntitamperStaticState, Section::Data> mASS;
+	ResolvedGlobalAddress<MappedRegions, Section::RData> mMR;
+	ResolvedAddress<Section::Text> mShuffle;
 	XorredField<u64, BootstrapStartState> mXorRtlAddVectoredExceptionHandler{ &BootstrapStartState::xorredRtlAddVectoredExceptionHandler, "RtlAddVectoredExceptionHandler" };
 	XorredField<u64, BootstrapStartState> mXorCloseHandle{ &BootstrapStartState::xorredCloseHandle, "CloseHandle" };
 	XorredField<u64, BootstrapStartState> mXorVirtualAlloc{ &BootstrapStartState::xorredVirtualAlloc, "VirtualAlloc" };
@@ -1007,23 +1042,24 @@ private:
 	XorredField<u64, BootstrapStartState> mXorVEHLastExcInfo{ &BootstrapStartState::vehXorredLastExceptionInfo, "VEHLastExcInfo" };
 
 	// special .text references
-	ResolvedAddress mTLSDecode;
-	ResolvedAddress mTLSFixup;
-	ResolvedAddress mTLSRuntime;
-	ResolvedAddress mVEHMain;
-	ResolvedAddress mVEHHashRegionStart;
-	ResolvedAddress mVEHHashRegionEnd;
-	ResolvedAddress mVEHContinuationFail;
-	ResolvedAddress mObfuscate;
-	ResolvedAddress mImportFail;
-	ResolvedAddress mUnencryptedStart;
-	ResolvedAddress mUnencryptedEnd;
-	ResolvedAddress mRemappedSegmentState;
-	ResolvedAddress mRemappedSegmentCount;
+	ResolvedAddress<Section::Text> mTLSDecode;
+	ResolvedAddress<Section::Text> mTLSFixup;
+	ResolvedAddress<Section::Text> mTLSRuntime;
+	ResolvedAddress<Section::Text> mVEHMain;
+	ResolvedAddress<Section::Text> mVEHHashRegionStart;
+	ResolvedAddress<Section::Text> mVEHHashRegionEnd;
+	ResolvedAddress<Section::Text> mVEHContinuationFail;
+	ResolvedAddress<Section::Text> mObfuscate;
+	ResolvedAddress<Section::Text> mImportFail;
+	ResolvedAddress<Section::Text> mUnencryptedStart;
+	ResolvedAddress<Section::Text> mUnencryptedEnd;
+	ResolvedAddress<Section::Text> mRemappedSegmentState;
+	ResolvedAddress<Section::Text> mRemappedSegmentCount;
 };
 
 int main(int argc, char* argv[])
 {
+	//analysis::unittestJumpChains();
 	if (argc < 2)
 	{
 		std::println("File name expected");

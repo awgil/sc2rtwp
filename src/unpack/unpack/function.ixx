@@ -706,10 +706,10 @@ private:
 	std::vector<Reference> mRefs; // rip-relative references, sorted by instruction RVAs
 };
 
-export class FunctionTable
+export class OldFunctionTable
 {
 public:
-	FunctionTable(PEBinary& binary) : mBinary(binary) {}
+	OldFunctionTable(PEBinary& binary) : mBinary(binary) {}
 
 	FunctionInfo* get(rva_t rva)
 	{

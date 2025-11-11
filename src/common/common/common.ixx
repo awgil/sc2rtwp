@@ -8,3 +8,4 @@ export import :pipe;
 export import :virtual_mem;
 export import :process;
 export import :small_vector;
+export import :log;
