@@ -4,17 +4,10 @@
 - update to latest patch
 
 unpacker:
-- function table
--- print out when antidebug stuff is found
--- entries for SEH handlers/filters and exports
--- recursive analysis
-- tidy up main
-- remove legacy
--- commented out conditional stuff in new function_block analyzer
--- old function/instruction stuff
--- disassembler in pebinary
-- ida interop
--- structs import/export
--- funcs import/export
+- entries for exports
 - patching instead of injection
-- implement switch tables detection in funcblocks
+-- fix remapped section state checks
+- actually refactor jumpchain stuff...
+- ida interop improvement - automatically import structs and sync to idb...
+- improve switch tables detection in funcblocks
+- print out when antidebug stuff is found

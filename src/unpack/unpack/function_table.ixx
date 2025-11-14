@@ -1,13 +1,19 @@
 export module unpack.function_table;
 
 export import unpack.analysis.function_block;
+export import unpack.analysis.simple_refs;
 export import unpack.range_map;
 export import unpack.pe_binary;
 export import unpack.patcher;
 
+export struct FunctionData : analysis::Function
+{
+	std::vector<analysis::Reference> refs;
+};
+
 export struct FunctionTableEntryInfo
 {
-	analysis::Function analyzed;
+	std::unique_ptr<FunctionData> analyzed; // TODO: this is annoying - we really need to support analyzing new functions recursively though, meaning either this or diffent container that doesn't invalidate iterators...
 	const SEHInfo::Entry* seh = nullptr;
 };
 
@@ -19,7 +25,11 @@ public:
 	using Entries = NamedRangeMap<rva_t, FunctionTableEntryInfo>;
 	using Entry = Entries::Entry;
 
-	FunctionTable(PEBinary& binary, const PEBinary::Section& text, Patcher& patcher) : mFBA(binary.bytes()), mTextEnd(text.end), mPatcher(patcher)
+	FunctionTable(PEBinary& binary, const PEBinary::Section& text, Patcher& patcher)
+		: mFBA(binary.bytes())
+		, mTextBegin(text.begin)
+		, mTextEnd(text.end)
+		, mPatcher(patcher)
 	{
 		// build a list of function pointers
 		std::vector<rva_t> funcStarts;
@@ -43,7 +53,7 @@ public:
 			}
 		}
 
-		// TODO: add exports, SEH handlers/filters (this probably would need identifying real handler)
+		// TODO: add exports
 
 		std::ranges::sort(funcStarts);
 		auto dupes = std::ranges::unique(funcStarts);
@@ -73,6 +83,7 @@ public:
 	// analyze single function that is assumed to be never analyzed before
 	auto& analyze(rva_t rva, std::string_view name, auto&& analyzeFunc)
 	{
+		ensure(rva >= mTextBegin && rva < mTextEnd);
 		auto next = mTable.findNext(rva);
 		auto existing = mTable.getPrevIfContains(next, rva);
 		std::println("Processing {} function '{}' at {:X}...", existing == mTable.end() ? "new" : "known", name, rva);
@@ -82,29 +93,72 @@ public:
 			next = existing + 1;
 		}
 
-		ensure(existing->name.empty() && existing->value.analyzed.instructions.empty()); // should never have been analyzed before
+		ensure(existing->name.empty() && !existing->value.analyzed); // should never have been analyzed before
 		ensure(existing->begin == rva); // should not start from the middle of the function
 		mTable.edit(existing).name = name;
-		auto& res = mTable.edit(existing).value.analyzed;
-		res = analyzeFunc(mFBA, rva, existing->value.seh ? existing->value.seh->end : next != mTable.end() ? next->begin : mTextEnd);
-		mPatcher.patchFunction(res, existing->value.seh ? existing->value.seh->end : 0);
-		mPatcher.patchHlts(res); // TODO: don't do this here, it's only relevant for a small subset of bootstrap functions...
-		if (res.blocks.back().end > existing->end)
-			mTable.extend(existing->end, res.blocks.back().end, next);
+		auto& res = *(mTable.edit(existing).value.analyzed = std::make_unique<FunctionData>());
+		auto seh = existing->value.seh;
+		res = analyzeFunc(mFBA, rva, seh ? seh->end : next != mTable.end() ? next->begin : mTextEnd, seh);
+		mPatcher.patchFunction(res, seh ? seh->end : 0);
+		res.refs = analysis::getSimpleRefs(res.instructions);
+		// add references to SEH filters
+		if (mPrimarySEHHandler && seh && seh->value.rva == mPrimarySEHHandler)
+			for (auto& scope : seh->value.scopeRecords())
+				if (scope.HandlerAddress > 1)
+					res.refs.push_back({ nullptr, 0, static_cast<rva_t>(scope.HandlerAddress) });
+		if (res.end() > existing->end)
+			mTable.extend(existing->end, res.end(), next);
 		return res;
 	}
 
 	auto& analyze(rva_t rva, std::string_view name)
 	{
-		return analyze(rva, name, [](analysis::FunctionBlockAnalysis& analyzer, rva_t begin, rva_t limit) {
-			return analyzer.analyze(begin, limit);
+		return analyze(rva, name, [&](analysis::FunctionBlockAnalysis<FunctionData>& analyzer, rva_t begin, rva_t limit, const SEHInfo::Entry* seh) {
+			analyzer.start(begin, limit);
+			analyzer.scheduleAndAnalyze(begin);
+			if (mPrimarySEHHandler && seh && seh->value.rva == mPrimarySEHHandler)
+			{
+				for (auto& scope : seh->value.scopeRecords())
+				{
+					if (scope.JumpTarget)
+					{
+						analyzer.scheduleAndAnalyze(scope.JumpTarget);
+					}
+					// else: null for finally blocks
+				}
+			}
+			return analyzer.finish();
 		});
 	}
 
+	void analyzeSEHHandlers(PEBinary& binary)
+	{
+		std::vector<rva_t> handlers;
+		for (auto& seh : binary.sehEntries())
+			if (seh.value.rva && !std::ranges::contains(handlers, seh.value.rva))
+				handlers.push_back(seh.value.rva);
+		ensure(handlers.size() == 4); // these are all library ones; we care about one with >4 calls
+		for (auto rva : handlers)
+		{
+			auto& handler = analyze(rva, "");
+			auto isPrimary = handler.refs.size() > 4;
+			std::println("Found {} SEH handler: {:X}", isPrimary ? "primary" : "secondary", rva);
+			if (isPrimary)
+			{
+				ensure(!mPrimarySEHHandler);
+				mPrimarySEHHandler = rva;
+			}
+		}
+	}
+
+	const auto& entries() const { return mTable; }
+
 private:
-	analysis::FunctionBlockAnalysis mFBA;
+	analysis::FunctionBlockAnalysis<FunctionData> mFBA;
+	rva_t mTextBegin;
 	rva_t mTextEnd;
 	Patcher& mPatcher;
 	Entries mTable;
+	rva_t mPrimarySEHHandler = 0; // IDA calls it __C_specific_handler
 };
 

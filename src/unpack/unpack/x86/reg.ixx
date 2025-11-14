@@ -75,17 +75,19 @@ export struct Reg
 	auto foffset() const { return info().foffset; }
 	auto frange() const { return info().frange(); }
 
-	auto isSegment() const { return mValue >= Reg::es && mValue <= Reg::gs; }
-	auto segIndex() const { ensure(isSegment()); return mValue - Reg::es; }
+	auto isSegment() const { return mValue >= es && mValue <= gs; }
+	auto segIndex() const { ensure(isSegment()); return mValue - es; }
 
-	auto isGPR32() const { return (mValue & 0xF0) == Reg::eax; }
-	auto isGPR64() const { return (mValue & 0xF0) == Reg::rax; }
-	auto isGPR32Or64() const { return (mValue & 0xE0) == Reg::eax;}
+	auto isGPR32() const { return (mValue & 0xF0) == eax; }
+	auto isGPR64() const { return (mValue & 0xF0) == rax; }
+	auto isGPR32Or64() const { return (mValue & 0xE0) == eax;}
 	auto gprIndex() const { return mValue & 0x0F; }
 
 	// factories to create register of specific type by index
 	static Reg makeRaw(int value) { ensure(value >= 0 && value < 256); return static_cast<Value>(value); }
 	static Reg makeSegment(int index) { ensure(index >= 0 && index < 6); return static_cast<Value>(0x08 | index); }
+	static Reg makeGPR32(int index) { return static_cast<Value>(eax | index); }
+	static Reg makeGPR64(int index) { return static_cast<Value>(rax | index); }
 
 private:
 	Value mValue{};

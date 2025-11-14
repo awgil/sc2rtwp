@@ -4,8 +4,8 @@ export import unpack.analysis.function_block;
 export import unpack.pe_binary;
 
 // debug logging
-enum class LogLevel { None, Important, Verbose };
-Logger logger{ "Patch", LogLevel::Verbose };
+enum class LogLevel { None, Important, Common, Verbose };
+Logger logger{ "Patch", LogLevel::Important };
 
 // utility for patching the binary
 // some patches are 'ida-only' - they break some functionality of the binary, but make it easier to analyze in ida
@@ -20,6 +20,156 @@ public:
 	{
 	}
 
+	bool applyIDAOnlyPatches() const { return mApplyIDAOnlyPatches; }
+	bool applyRuntimeOnlyPatches() const { return mApplyRuntimeOnlyPatches; }
+
+	// apply universal function patches:
+	// - replace parsed jump chains with real jumps
+	// - fill space between blocks (and, if end is known, between last block end and function end) with nops/int3
+	// - if doing ida-only patches, remove rbp overalign for avx (ida can't cope with it)
+	void patchFunction(analysis::Function& func, rva_t end = 0)
+	{
+		end = end ? end : func.end(); // if not specified, just use last block end...
+
+		// patch jumps and fill space between blocks
+		u8 nop = mApplyIDAOnlyPatches ? 0x90 : 0xCC; // ida prefers nop fill, for runtime int3 allows us to find where I fucked up
+		int numPatchedJumps = 0;
+		for (auto block = func.blocks.begin(); block != func.blocks.end(); ++block)
+		{
+			auto iNext = block + 1;
+			auto nextStart = iNext != func.blocks.end() ? iNext->begin : end;
+
+			auto lastIns = block->insCount() ? &func.blockInstructions(*block).back() : nullptr;
+			if (lastIns && lastIns->mnem == X86_INS_JMP && lastIns->length == 1)
+			{
+				// found jump to patch - real jumps can't have length 1
+				auto target = lastIns->ops[0].immediate<i32>();
+				logger(LogLevel::Common, "jump chain {:X}->{:X}, next block at {:X}", lastIns->rva, target, nextStart);
+				lastIns->length = writeJmp(lastIns->rva, target);
+				func.blocks.extend(block->end, lastIns->endRVA(), iNext);
+				fill(block->end, nextStart, nop);
+				++numPatchedJumps;
+			}
+			else if (nextStart > block->end)
+			{
+				// TODO: do we really want to nop-fill this?.. might be analysis errors rather than genuine trash instructions...
+				for (auto rva = block->end; rva < nextStart; )
+				{
+					auto ins = x86::disasm(mBinary.bytes(), rva);
+					ensure(ins.mnem == X86_INS_NOP || ins.mnem == X86_INS_INT3);
+					rva += ins.length;
+					ensure(rva <= nextStart);
+				}
+			}
+		}
+
+		if (numPatchedJumps)
+			logger(LogLevel::Important, "Patched {} jumps", numPatchedJumps);
+
+		// if a function uses AVX instructions, compiler aligns rbp to 0x20, so that it can then use aligned versions
+		// unfortunately hexrays really struggles with it
+		// so for analysis, patch `and rbp, ~0x1F` with effective nop
+		// assume if it's there, it's in first block
+		auto instructions = func.blockInstructions(0);
+		auto rbpOveralign = std::ranges::find_if(instructions, [](const x86::Instruction& ins) {
+			return ins.mnem == X86_INS_AND && ins.ops[0] == x86::Reg::rbp && ins.ops[1] == ~0x1Fll; });
+		if (rbpOveralign != instructions.end())
+		{
+			logger(LogLevel::Important, "rbp overalign at {:X}: {} ({})", rbpOveralign->rva, *rbpOveralign, mApplyIDAOnlyPatches ? "applying" : "skipping"); // TODO: lower log level
+			auto& immByte = mBinary.bytes()[rbpOveralign->rva + rbpOveralign->length - 1];
+			ensure(immByte == 0xE0);
+			if (mApplyIDAOnlyPatches)
+				immByte = 0xFF;
+		}
+	}
+
+	// some specific functions in bootstrap code use hlt instruction to communicate with VEH handler
+	// unfortunately, IDA considers hlt to be ret-like instruction, so it doesn't create flow xref to next instruction
+	// even if fixed manually, hex-rays then considers hlt intrinsic to be no-return
+	// a replacement can be any single-byte instruction that isn't used much in normal code, eg. icebp (0xF1)
+	void patchHlts(const analysis::Function& func, u8 replacement = 0xF1)
+	{
+		for (auto& ins : func.instructions | std::views::filter([](const auto& ins) { return ins.mnem == X86_INS_HLT; }))
+		{
+			logger(LogLevel::Important, "hlt at {:X} ({})", ins.rva, mApplyIDAOnlyPatches ? "applying" : "skipping");
+			if (mApplyIDAOnlyPatches)
+				mBinary.bytes()[ins.rva] = replacement;
+		}
+	}
+
+	// patch conditional jump to unconditional, on runtime only
+	void patchJumpToUnconditional(rva_t rva, std::string_view reason)
+	{
+		auto* address = &mBinary.bytes()[rva];
+		if ((address[0] & 0xF0) == 0x70)
+		{
+			logger(LogLevel::Important, "jcc->jmp (short) at {:X} for {} ({})", rva, reason, mApplyRuntimeOnlyPatches ? "applying" : "skipping");
+			if (mApplyRuntimeOnlyPatches)
+				address[0] = 0xEB;
+		}
+		else if (address[0] == 0x0F && (address[1] & 0xF0) == 0x80)
+		{
+			logger(LogLevel::Important, "jcc->jmp (near) at {:X} for {} ({})", rva, reason, mApplyRuntimeOnlyPatches ? "applying" : "skipping");
+			if (mApplyRuntimeOnlyPatches)
+			{
+				address[0] = 0x90;
+				address[1] = 0xE9;
+			}
+		}
+		else
+		{
+			throw std::runtime_error(std::format("Failed to patch jump at {:X}: {:02X}", rva, address[0]));
+		}
+	}
+
+	// patch xor to mov, on runtime only
+	void patchXorToMov(rva_t rva, std::string_view reason)
+	{
+		auto* address = &mBinary.bytes()[rva];
+		if (address[0] == 0x30)
+		{
+			logger(LogLevel::Important, "xor->mov r/m8, r8 at {:X} for {} ({})", rva, reason, mApplyRuntimeOnlyPatches ? "applying" : "skipping");
+			if (mApplyRuntimeOnlyPatches)
+				address[0] = 0x88;
+		}
+	}
+
+	// log and apply generic patch
+	void patchGeneric(std::span<const u8> code, rva_t rva, rva_t end, std::string_view reason, bool runtimeOnly = true)
+	{
+		auto apply = !runtimeOnly || mApplyRuntimeOnlyPatches;
+		logger(LogLevel::Important, "patching {} at {:X} ({})", reason, rva, apply ? "applying" : "skipping");
+		if (apply)
+			patch(code, rva, end);
+	}
+
+	// decrypt modified-RC4-encrypted data (can also encrypt, since it's symmetric)
+	// see https://en.wikipedia.org/wiki/RC4 - but note that some customized version of PRGA is used (different key generation scheme)
+	void decryptModifiedRC4(std::span<const u8> key, std::span<u8> data)
+	{
+		// KSA: build permutation array s
+		std::array<u8, 256> s;
+		std::ranges::iota(s, 0);
+		u8 j = 0;
+		for (int i = 0; i < s.size(); ++i)
+		{
+			j += s[i] + key[i % key.size()];
+			std::swap(s[i], s[j]);
+		}
+
+		// modified PRGA: generate pseudo-random stream of xor keys
+		u8 i = 0;
+		j = 0;
+		for (auto& b : data)
+		{
+			j += s[++i];
+			b ^= s[i]; // note: this is a customization! normally it would be s[s[i] + s[j]]
+			std::swap(s[i], s[j]);
+		}
+	}
+	template<typename T> void decryptModifiedRC4(std::span<const u8> key, T& data) { decryptModifiedRC4(key, { reinterpret_cast<u8*>(&data), sizeof data }); }
+
+private:
 	// primitive write operation
 	void write(std::span<const u8> patch, rva_t rva) { std::memcpy(mBinary.bytes().data() + rva, patch.data(), patch.size()); }
 
@@ -50,86 +200,6 @@ public:
 		return isShort ? 2 : 5;
 	}
 
-	// apply universal function patches:
-	// - replace parsed jump chains with real jumps
-	// - fill space between blocks (and, if end is known, between last block end and function end) with nops/int3
-	// - if doing ida-only patches, remove rbp overalign for avx (ida can't cope with it)
-	void patchFunction(analysis::Function& func, rva_t end = 0)
-	{
-		// patch jumps
-		int numPatchedJumps = 0;
-		for (auto block = func.blocks.begin(); block != func.blocks.end(); ++block)
-		{
-			if (!block->insCount())
-				continue;
-			auto& lastIns = func.blockInstructions(*block).back();
-			if (lastIns.mnem != X86_INS_JMP || lastIns.length != 1)
-				continue;
-			// found a jump chain - real jumps can't have length 1
-			lastIns.length = writeJmp(lastIns.rva, lastIns.ops[0].immediate<i32>());
-			func.blocks.extend(block->end, lastIns.rva + lastIns.length, block + 1);
-			++numPatchedJumps;
-		}
-
-		// fill space between blocks
-		int numNopFillsMid = 0, numNopFillsEnd = 0;
-		u8 nop = mApplyIDAOnlyPatches ? 0x90 : 0xCC; // ida prefers nop fill, for runtime int3 allows us to find where I fucked up
-		for (auto&& [from, to] : func.blocks | std::views::pairwise)
-		{
-			if (to.begin != from.end)
-			{
-				logger(LogLevel::Verbose, "nop fill between {:X} and {:X}", from.end, to.begin);
-				fill(from.end, to.begin, nop);
-				++numNopFillsMid;
-			}
-		}
-		if (end)
-		{
-			auto& last = func.blocks.back();
-			if (end != last.end)
-			{
-				logger(LogLevel::Verbose, "nop fill between {:X} and {:X}", last.end, end);
-				fill(last.end, end, nop);
-				++numNopFillsEnd;
-			}
-		}
-
-		if (numPatchedJumps + numNopFillsMid + numNopFillsEnd)
-			logger(LogLevel::Important, "Patched {} jumps, {}+{} nops", numPatchedJumps, numNopFillsMid, numNopFillsEnd);
-
-		if (mApplyIDAOnlyPatches)
-		{
-			// if a function uses AVX instructions, compiler aligns rbp to 0x20, so that it can then use aligned versions
-			// unfortunately hexrays really struggles with it
-			// so for analysis, patch `and rbp, ~0x1F` with effective nop
-			// assume if it's there, it's in first block
-			auto instructions = func.blockInstructions(0);
-			auto rbpOveralign = std::ranges::find_if(instructions, [](const x86::Instruction& ins) { return ins.mnem == X86_INS_AND && ins.ops[0] == x86::Reg::rbp && ins.ops[1] == ~0x1F; });
-			if (rbpOveralign != instructions.end())
-			{
-				logger(LogLevel::Important, "rbp overalign: {:X} {}", rbpOveralign->rva, *rbpOveralign);
-				auto& immByte = mBinary.bytes()[rbpOveralign->rva + rbpOveralign->length - 1];
-				ensure(immByte == 0xE0);
-				immByte = 0xFF;
-			}
-		}
-	}
-
-	// some specific functions in bootstrap code use hlt instruction to communicate with VEH handler
-	// unfortunately, IDA considers hlt to be ret-like instruction, so it doesn't create flow xref to next instruction
-	// even if fixed manually, hex-rays then considers hlt intrinsic to be no-return
-	// a replacement can be any single-byte instruction that isn't used much in normal code, eg. icebp (0xF1)
-	void patchHlts(const analysis::Function& func, u8 replacement = 0xF1)
-	{
-		if (mApplyIDAOnlyPatches)
-		{
-			for (auto& ins : func.instructions | std::views::filter([](const auto& ins) { return ins.mnem == X86_INS_HLT; }))
-			{
-				logger(LogLevel::Important, "hlt at {:X}", ins.rva);
-				mBinary.bytes()[ins.rva] = replacement;
-			}
-		}
-	}
 
 private:
 	PEBinary& mBinary;

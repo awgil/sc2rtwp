@@ -42,6 +42,7 @@ export struct Operand
 	Operand() : type(OpType::Invalid), size(0), imm(0) {}
 	explicit Operand(Reg reg) : type(OpType::Reg), size(reg.width()), reg(reg) {}
 	explicit Operand(Reg reg, i8 size) : type(OpType::Reg), size(size), reg(reg) {}
+	explicit Operand(Reg::Value reg, i8 size) : type(OpType::Reg), size(size), reg(reg) {}
 	explicit Operand(i64 imm, i8 size) : type(OpType::Imm), size(size), imm(imm) {}
 	explicit Operand(OpMem mem, i8 size) : type(OpType::Mem), size(size), mem(mem) {}
 
@@ -61,6 +62,7 @@ export struct Operand
 	}
 
 	bool operator==(Reg rhs) const { return type == OpType::Reg && reg == rhs; }
+	bool operator==(Reg::Value rhs) const { return type == OpType::Reg && reg == rhs; }
 	bool operator==(i64 rhs) const { return type == OpType::Imm && (size < 8 ? (((imm ^ rhs) & ((1ull << 8 * size) - 1)) == 0) : imm == rhs); }
 	bool operator==(const OpMem& rhs) const { return type == OpType::Mem && mem == rhs; }
 };

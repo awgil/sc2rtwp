@@ -237,7 +237,7 @@ export i32 findJumpChainTarget(std::span<const u8> imageBytes, const x86::Instru
 		return 0;
 	log(LogLevel::Verbose, "Starting from {:X}", ins.rva);
 	auto target = findJumpChainEnd(imageBytes, ins, {}, NestingTracker().push());
-	ensure(target || ins.mnem == X86_INS_TEST || isJccRel(ins)); // jcc and test are encountered normally
+	//ensure(target || ins.mnem == X86_INS_TEST || isJccRel(ins)); // jcc and test are encountered normally, i've also seen effective-nops in constant obfuscation code, really we should only complain if we've seen some always/never-taken jccs...
 	return target;
 }
 

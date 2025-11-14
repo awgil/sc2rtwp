@@ -1,7 +1,6 @@
 module;
 
 #include <common/win_headers.h>
-#include <capstone/capstone.h>
 
 export module unpack.pe_binary;
 
@@ -16,7 +15,7 @@ export using rva_t = int;
 class BinaryReader
 {
 public:
-	explicit BinaryReader(const char* path) : mStream(path, std::ios::binary) {}
+	explicit BinaryReader(const std::filesystem::path& path) : mStream(path, std::ios::binary) {}
 
 	void readRaw(size_t offset, void* buffer, size_t size)
 	{
@@ -40,7 +39,7 @@ private:
 class BinaryWriter
 {
 public:
-	explicit BinaryWriter(const char* path) : mStream(path, std::ios::binary) {}
+	explicit BinaryWriter(const std::filesystem::path& path) : mStream(path, std::ios::binary) {}
 
 	void writeRaw(size_t offset, const void* buffer, size_t size)
 	{
@@ -52,38 +51,6 @@ private:
 	std::ofstream mStream;
 };
 
-// simple wrapper around capstone disassembler
-class Disassembler
-{
-public:
-	Disassembler()
-	{
-		ensure(cs_open(CS_ARCH_X86, CS_MODE_64, &mCapstone) == CS_ERR_OK);
-		ensure(cs_option(mCapstone, CS_OPT_DETAIL, CS_OPT_ON) == CS_ERR_OK);
-		mInsn = cs_malloc(mCapstone);
-		ensure(mInsn);
-	}
-
-	~Disassembler()
-	{
-		cs_free(mInsn, 1);
-		ensure(cs_close(&mCapstone) == CS_ERR_OK);
-	}
-
-	// note: the returned pointer is only valid until next disasm call!
-	cs_insn* disasm(const uint8_t* code, size_t size, size_t address) const
-	{
-		return cs_disasm_iter(mCapstone, &code, &size, &address, mInsn) ? mInsn : nullptr;
-	}
-
-	const char* instructionName(x86_insn isn) const { return cs_insn_name(mCapstone, isn); }
-	const char* registerName(x86_reg reg) const { return cs_reg_name(mCapstone, reg); }
-
-private:
-	csh mCapstone = {};
-	cs_insn* mInsn = nullptr;
-};
-
 // raw PE binary, that can parse headers and load sections at correct addresses - but does not parse contents of specific sections
 class RawPEBinary
 {
@@ -91,7 +58,7 @@ public:
 	using Sections = NamedRangeMap<rva_t, IMAGE_SECTION_HEADER*, std::string_view>;
 	using Section = Sections::Entry;
 
-	explicit RawPEBinary(const char* path)
+	explicit RawPEBinary(const std::filesystem::path& path)
 	{
 		BinaryReader source{ path };
 
@@ -116,7 +83,7 @@ public:
 		source.readRaw(certEntry.VirtualAddress, mCertBytes.data(), certEntry.Size);
 	}
 
-	void save(const char* path)
+	void save(const std::filesystem::path& path)
 	{
 		BinaryWriter writer{ path };
 		writer.writeRaw(0, mBytes.data(), mPEHeader->OptionalHeader.SizeOfHeaders);
@@ -184,6 +151,8 @@ public:
 	{
 		rva_t rva; // 0 if no handlers
 		SCOPE_TABLE* data;
+
+		auto scopeRecords(this auto&& self) { return std::span(self.data->ScopeRecord, self.data->Count); }
 	};
 	using Entries = SimpleRangeMap<rva_t, Handler>;
 	using Entry = typename Entries::Entry;
@@ -311,23 +280,11 @@ private:
 export class PEBinary : public RawPEBinary, public SEHInfo, public RelocInfo, public TLSInfo
 {
 public:
-	PEBinary(const char* path)
+	PEBinary(const std::filesystem::path& path)
 		: RawPEBinary(path)
 		, SEHInfo(static_cast<RawPEBinary&>(*this))
 		, RelocInfo(static_cast<RawPEBinary&>(*this))
 		, TLSInfo(static_cast<RawPEBinary&>(*this))
 	{
 	}
-
-	// note: the returned pointer is only valid until next disasm call!
-	cs_insn* disasm(rva_t rva) const
-	{
-		return mDisasm.disasm(mBytes.data() + rva, mBytes.size() - rva, imageBase() + rva);
-	}
-
-	const char* instructionName(x86_insn isn) const { return mDisasm.instructionName(isn); }
-	const char* registerName(x86_reg reg) const { return mDisasm.registerName(reg); }
-
-private:
-	Disassembler mDisasm;
 };
