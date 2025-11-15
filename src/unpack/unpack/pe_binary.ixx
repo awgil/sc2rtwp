@@ -1,6 +1,7 @@
 module;
 
 #include <common/win_headers.h>
+#include <ehdata.h>
 
 export module unpack.pe_binary;
 
@@ -150,9 +151,15 @@ public:
 	struct Handler
 	{
 		rva_t rva; // 0 if no handlers
-		SCOPE_TABLE* data;
+		void* payload;
 
-		auto scopeRecords(this auto&& self) { return std::span(self.data->ScopeRecord, self.data->Count); }
+		// this is only valid for __C_specific_handler or __GSHandlerCheck_SEH
+		auto scopeRecords() const { auto scopeTable = reinterpret_cast<SCOPE_TABLE*>(payload); return std::span(scopeTable->ScopeRecord, scopeTable->Count); }
+
+		// this is only valid for __CxxFrameHandler3 or __GSHandlerCheck_EH
+		auto& funcInfo(RawPEBinary& bin) const { return *bin.structAtRVA<FuncInfo>(*reinterpret_cast<rva_t*>(payload)); }
+		auto tryBlocks(RawPEBinary& bin) const { auto& info = funcInfo(bin); return std::span(bin.structAtRVA<TryBlockMapEntry>(info.dispTryBlockMap), info.nTryBlocks); }
+		auto catchBlocks(RawPEBinary& bin, TryBlockMapEntry& tryBlock) const { return std::span(bin.structAtRVA<HandlerType>(tryBlock.dispHandlerArray), tryBlock.nCatches); }
 	};
 	using Entries = SimpleRangeMap<rva_t, Handler>;
 	using Entry = typename Entries::Entry;
@@ -184,7 +191,7 @@ public:
 				{
 					auto handler = reinterpret_cast<rva_t*>(&unwind.UnwindCode[(unwind.CountOfCodes + 1) & ~1]);
 					h.rva = *handler;
-					h.data = reinterpret_cast<SCOPE_TABLE*>(handler + 1);
+					h.payload = handler + 1;
 				}
 				mEntries.insert({ static_cast<rva_t>(e.BeginAddress), static_cast<rva_t>(e.EndAddress), h }, mEntries.end());
 			}

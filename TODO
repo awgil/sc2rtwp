@@ -4,10 +4,14 @@
 - update to latest patch
 
 unpacker:
+- seh
+-- move to separate analyzer
+-- cxx handlers (see 209CBC0)
 - entries for exports
 - patching instead of injection
 -- fix remapped section state checks
 - actually refactor jumpchain stuff...
 - ida interop improvement - automatically import structs and sync to idb...
 - improve switch tables detection in funcblocks
+-- move to separate analyzer
 - print out when antidebug stuff is found

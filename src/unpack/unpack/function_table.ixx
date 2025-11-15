@@ -9,6 +9,7 @@ export import unpack.patcher;
 export struct FunctionData : analysis::Function
 {
 	std::vector<analysis::Reference> refs;
+	std::vector<rva_t> exceptionHandlers; // note: external functions (eg. SEH filters)
 };
 
 export struct FunctionTableEntryInfo
@@ -26,7 +27,8 @@ public:
 	using Entry = Entries::Entry;
 
 	FunctionTable(PEBinary& binary, const PEBinary::Section& text, Patcher& patcher)
-		: mFBA(binary.bytes())
+		: mBinary(binary)
+		, mFBA(binary.bytes())
 		, mTextBegin(text.begin)
 		, mTextEnd(text.end)
 		, mPatcher(patcher)
@@ -81,72 +83,129 @@ public:
 	}
 
 	// analyze single function that is assumed to be never analyzed before
-	auto& analyze(rva_t rva, std::string_view name, auto&& analyzeFunc)
+	// all the exception handlers are also analyzed automatically (but not stuff they call)
+	FunctionData& analyze(rva_t rva, std::string_view name, auto&& analyzeFunc, bool allowExisting = false)
 	{
+		ensure(rva != 0x023e29f0);
 		ensure(rva >= mTextBegin && rva < mTextEnd);
 		auto next = mTable.findNext(rva);
 		auto existing = mTable.getPrevIfContains(next, rva);
-		std::println("Processing {} function '{}' at {:X}...", existing == mTable.end() ? "new" : "known", name, rva);
-		if (existing == mTable.end())
+		auto isNew = existing == mTable.end();
+		if (isNew)
 		{
 			existing = mTable.insert({ rva, rva + 1 }, next);
 			next = existing + 1;
 		}
-
+		if (allowExisting && existing->value.analyzed)
+			return *existing->value.analyzed;
 		ensure(existing->name.empty() && !existing->value.analyzed); // should never have been analyzed before
 		ensure(existing->begin == rva); // should not start from the middle of the function
 		mTable.edit(existing).name = name;
 		auto& res = *(mTable.edit(existing).value.analyzed = std::make_unique<FunctionData>());
+
+		// before analyzing the function itself, we need to analyze exception related functions - they might refer to blocks that are otherwise unreachable
+		std::vector<rva_t> extraBlocks, externalFuncs;
 		auto seh = existing->value.seh;
-		res = analyzeFunc(mFBA, rva, seh ? seh->end : next != mTable.end() ? next->begin : mTextEnd, seh);
+		if (seh && seh->value.rva)
+		{
+			if (seh->value.rva == mCSpecificHandler)
+			{
+				for (auto& scope : seh->value.scopeRecords())
+				{
+					if (scope.HandlerAddress > 1) // try-except filter and try-finally finally blocks are separate functions
+						externalFuncs.push_back(scope.HandlerAddress);
+					if (scope.JumpTarget) // try-except block has except body in function
+						extraBlocks.push_back(scope.JumpTarget);
+				}
+			}
+			else if (seh->value.rva == mCxxFrameHandler || seh->value.rva == mGSHandlerCheckEH)
+			{
+				// TODO: consider adding unwind funclets as functions; there are tons of them and they are all trivial (usually tail-recursion jump), so not sure there's a point...
+				for (auto& tryBlock : seh->value.tryBlocks(mBinary))
+				{
+					for (auto& catchBlock : seh->value.catchBlocks(mBinary, tryBlock))
+					{
+						// catch blocks are implemented as separate functions that return external block address
+						externalFuncs.push_back(catchBlock.dispOfHandler);
+					}
+				}
+			}
+		}
+
+		for (int i = 0; auto handler : externalFuncs)
+		{
+			auto& external = analyze(handler, name.empty() ? "" : std::format("{}_seh{}", name, i++), true);
+			if (!external.refs.empty() && external.refs.back().ref >= rva && external.refs.back().ref < seh->end)
+			{
+				ensure(external.refs.back().ins->ops[0] == x86::Reg::rax);
+				extraBlocks.push_back(external.refs.back().ref);
+			}
+		}
+		if (!externalFuncs.empty())
+		{
+			// we could have added new functions, so we need to re-fetch iterators
+			next = mTable.findNext(rva);
+			existing = next - 1;
+			ensure(existing->begin == rva);
+		}
+
+		std::println("Processing {} function '{}' at {:X}...", isNew ? "new" : "known", name, rva);
+		res = analyzeFunc(mFBA, rva, seh ? seh->end : next != mTable.end() ? next->begin : mTextEnd, extraBlocks);
 		mPatcher.patchFunction(res, seh ? seh->end : 0);
 		res.refs = analysis::getSimpleRefs(res.instructions);
-		// add references to SEH filters
-		if (mPrimarySEHHandler && seh && seh->value.rva == mPrimarySEHHandler)
-			for (auto& scope : seh->value.scopeRecords())
-				if (scope.HandlerAddress > 1)
-					res.refs.push_back({ nullptr, 0, static_cast<rva_t>(scope.HandlerAddress) });
+		res.exceptionHandlers = std::move(externalFuncs);
 		if (res.end() > existing->end)
 			mTable.extend(existing->end, res.end(), next);
 		return res;
 	}
 
-	auto& analyze(rva_t rva, std::string_view name)
+	auto& analyze(rva_t rva, std::string_view name, bool allowExisting = false)
 	{
-		return analyze(rva, name, [&](analysis::FunctionBlockAnalysis<FunctionData>& analyzer, rva_t begin, rva_t limit, const SEHInfo::Entry* seh) {
+		return analyze(rva, name, [&](analysis::FunctionBlockAnalysis<FunctionData>& analyzer, rva_t begin, rva_t limit, std::span<const rva_t> extraBlocks) {
 			analyzer.start(begin, limit);
 			analyzer.scheduleAndAnalyze(begin);
-			if (mPrimarySEHHandler && seh && seh->value.rva == mPrimarySEHHandler)
-			{
-				for (auto& scope : seh->value.scopeRecords())
-				{
-					if (scope.JumpTarget)
-					{
-						analyzer.scheduleAndAnalyze(scope.JumpTarget);
-					}
-					// else: null for finally blocks
-				}
-			}
+			for (auto rva : extraBlocks)
+				analyzer.scheduleAndAnalyze(rva);
 			return analyzer.finish();
-		});
+		}, allowExisting);
 	}
 
-	void analyzeSEHHandlers(PEBinary& binary)
+	void analyzeSEHHandlers()
 	{
-		std::vector<rva_t> handlers;
-		for (auto& seh : binary.sehEntries())
-			if (seh.value.rva && !std::ranges::contains(handlers, seh.value.rva))
-				handlers.push_back(seh.value.rva);
-		ensure(handlers.size() == 4); // these are all library ones; we care about one with >4 calls
-		for (auto rva : handlers)
+		std::vector<rva_t> handlerRVAs;
+		for (auto& seh : mBinary.sehEntries())
+			if (seh.value.rva && !std::ranges::contains(handlerRVAs, seh.value.rva))
+				handlerRVAs.push_back(seh.value.rva);
+		ensure(handlerRVAs.size() == 4); // these are all library ones - note that SC2 doesn't have the __GSHandlerCheck_SEH variant...
+		auto handlers = handlerRVAs | std::views::transform([&](rva_t rva) -> auto& { return analyze(rva, ""); }) | std::ranges::to<std::vector<std::reference_wrapper<FunctionData>>>();
+		// heuristics to classify handlers...
+		for (FunctionData& handler : handlers)
 		{
-			auto& handler = analyze(rva, "");
-			auto isPrimary = handler.refs.size() > 4;
-			std::println("Found {} SEH handler: {:X}", isPrimary ? "primary" : "secondary", rva);
-			if (isPrimary)
+			switch (handler.refs.size())
 			{
-				ensure(!mPrimarySEHHandler);
-				mPrimarySEHHandler = rva;
+			case 1:
+				// this one simply calls __GSHandlerCheckCommon
+				std::println("SEH handler at {:X} = __GSHandlerCheck", handler.begin());
+				break;
+			case 2:
+				// this one calls __GSHandlerCheckCommon and __CxxFrameHandler3
+				ensure(std::ranges::contains(handlerRVAs, handler.refs[1].ref));
+				mGSHandlerCheckEH = handler.begin();
+				std::println("SEH handler at {:X} = __GSHandlerCheck_EH", handler.begin());
+				break;
+			case 4:
+				// this one calls __vcrt_getptd 3x and then __InternalCxxFrameHandler
+				ensure(handler.refs[1].ref == handler.refs[0].ref && handler.refs[2].ref == handler.refs[0].ref);
+				mCxxFrameHandler = handler.begin();
+				std::println("SEH handler at {:X} = __CxxFrameHandler3", handler.begin());
+				break;
+			case 8:
+				// this one calls a whole lot of shit
+				mCSpecificHandler = handler.begin();
+				std::println("SEH handler at {:X} = __C_specific_handler", handler.begin());
+				break;
+			default:
+				__debugbreak();
 			}
 		}
 	}
@@ -154,11 +213,15 @@ public:
 	const auto& entries() const { return mTable; }
 
 private:
+	PEBinary& mBinary;
 	analysis::FunctionBlockAnalysis<FunctionData> mFBA;
 	rva_t mTextBegin;
 	rva_t mTextEnd;
 	Patcher& mPatcher;
 	Entries mTable;
-	rva_t mPrimarySEHHandler = 0; // IDA calls it __C_specific_handler
+	// SEH top level handlers
+	rva_t mCSpecificHandler = 0;
+	rva_t mCxxFrameHandler = 0;
+	rva_t mGSHandlerCheckEH = 0;
 };
 

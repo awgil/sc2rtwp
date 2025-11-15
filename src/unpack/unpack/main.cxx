@@ -164,10 +164,11 @@ public:
 		processTLSInitial();
 		processTLSDecode();
 		processTLSFixup();
-		processEmptyFunc(mTLSRuntime.address(), "tlsRuntime"); // everything there is done by filter
 
 		// process SEH stuff now that it's decoded - it's important to find _C_specific_handler, so that we know to parse C_SCOPE_TABLE SEH structures and add exception handler blocks...
-		mFuncTable.analyzeSEHHandlers(mBinary);
+		mFuncTable.analyzeSEHHandlers();
+
+		processTLSRuntime();
 
 		// process all remaining functions recursively
 		std::vector<rva_t> pending;
@@ -216,7 +217,8 @@ private:
 	void processBootstrapStart()
 	{
 		// note: bootstrap function is noreturn, and the very last block containing 'normal' return is unreachable
-		auto& func = mFuncTable.analyze(mBinary.entryPoint(), "bootstrapStart", [](auto& analyzer, rva_t start, rva_t limit, const SEHInfo::Entry* seh) {
+		auto& func = mFuncTable.analyze(mBinary.entryPoint(), "bootstrapStart", [](auto& analyzer, rva_t start, rva_t limit, std::span<const rva_t> extraBlocks) {
+			ensure(extraBlocks.empty());
 			analyzer.start(start, limit);
 			analyzer.scheduleAndAnalyze(start);
 			analyzer.scheduleAndAnalyze(analyzer.currentBlocks().back().end);
@@ -672,10 +674,24 @@ private:
 		}
 	}
 
-	void processEmptyFunc(rva_t rva, std::string_view name)
+	void processTLSRuntime()
+	{
+		auto& func = processEmptyFunc(mTLSRuntime.address(), "tlsRuntime"); // everything there is done by filter
+		ensure(func.exceptionHandlers.size() == 1);
+
+		auto* filter = mFuncTable.entries().find(func.exceptionHandlers[0]);
+		ensure(filter && filter->value.analyzed->refs.size() == 1);
+
+		auto& impl = processWrapperFunc(filter->value.analyzed->refs[0].ref, "tlsRuntimeFilter");
+		// TODO: deal with it all...
+		ensure(std::ranges::all_of(impl.refs, [&](const auto& ref) { return ref.ref == mObfuscate.address() || !sectionText().contains(ref.ref); }));
+	}
+
+	FunctionData& processEmptyFunc(rva_t rva, std::string_view name)
 	{
 		auto& func = mFuncTable.analyze(rva, name);
 		ensure(func.refs.empty());
+		return func;
 	}
 
 	auto& processLeafFunc(rva_t rva, std::string_view name)
