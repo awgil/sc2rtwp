@@ -86,7 +86,6 @@ public:
 	// all the exception handlers are also analyzed automatically (but not stuff they call)
 	FunctionData& analyze(rva_t rva, std::string_view name, auto&& analyzeFunc, bool allowExisting = false)
 	{
-		ensure(rva != 0x023e29f0);
 		ensure(rva >= mTextBegin && rva < mTextEnd);
 		auto next = mTable.findNext(rva);
 		auto existing = mTable.getPrevIfContains(next, rva);
