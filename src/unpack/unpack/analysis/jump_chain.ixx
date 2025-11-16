@@ -120,7 +120,7 @@ bool isFlagsOnly(const x86::Instruction& ins)
 bool isJmpRel(const x86::Instruction& ins) { return ins.mnem == X86_INS_JMP && ins.ops[0].type == x86::OpType::Imm; }
 bool isJccRel(const x86::Instruction& ins) { return ins.mnem.isConditionalJump() && ins.ops[0].type == x86::OpType::Imm; }
 i32 relTarget(const x86::Instruction& ins) { return ins.ops[0].immediate<i32>(); }
-bool isTestConditionNormal(x86::Condition cond) { return cond == x86::Condition::ZF || cond == x86::Condition::CZ || cond == x86::Condition::LE || cond == x86::Condition::SF; } // these condition are meaningful after test (SF is proxy for SO, for < 0)
+bool isTestConditionNormal(x86::Condition cond) { return cond != x86::Condition::OF && cond != x86::Condition::CF && cond != x86::Condition::PF; } // these condition are meaningful after test (SF is proxy for SO, for < 0)
 
 // update condition state for specific instruction
 ConditionState updateConditionFlagsOnly(ConditionState cond, x86::Mnem mnem)

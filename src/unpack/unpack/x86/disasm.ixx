@@ -206,7 +206,7 @@ Reg convertReg(x86_reg reg)
 	case X86_REG_R13W: return Reg::r13w;
 	case X86_REG_R14W: return Reg::r14w;
 	case X86_REG_R15W: return Reg::r15w;
-	default: throw std::runtime_error("Unexpected register");
+	default: __debugbreak(); throw std::runtime_error("Unexpected register");
 	}
 }
 

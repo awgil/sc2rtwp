@@ -163,6 +163,7 @@ public:
 		processBootstrapStart();
 		processTLSInitial();
 		processTLSDecode();
+		processBootstrapJunk();
 		processTLSFixup();
 
 		// process SEH stuff now that it's decoded - it's important to find _C_specific_handler, so that we know to parse C_SCOPE_TABLE SEH structures and add exception handler blocks...
@@ -171,22 +172,7 @@ public:
 		processTLSRuntime();
 
 		// process all remaining functions recursively
-		std::vector<rva_t> pending;
-		pending.reserve(mFuncTable.entries().size());
-		for (auto& func : mFuncTable.entries())
-			if (!func.value.analyzed)
-				pending.push_back(func.begin);
-		while (!pending.empty())
-		{
-			auto next = pending.back();
-			pending.pop_back();
-			if (auto existing = mFuncTable.entries().find(next); existing && existing->value.analyzed)
-				continue;
-			auto& func = mFuncTable.analyze(next, "");
-			for (auto& ref : func.refs)
-				if (sectionText().contains(ref.ref))
-					pending.push_back(ref.ref);
-		}
+		mFuncTable.analyzeAllRemaining();
 
 		// sanity checks
 		//for (auto& func : mFuncTable.entries())
@@ -221,7 +207,7 @@ private:
 			ensure(extraBlocks.empty());
 			analyzer.start(start, limit);
 			analyzer.scheduleAndAnalyze(start);
-			analyzer.scheduleAndAnalyze(analyzer.currentBlocks().back().end);
+			//analyzer.scheduleAndAnalyze(analyzer.currentBlocks().back().end);
 			return analyzer.finish();
 		});
 
@@ -677,14 +663,34 @@ private:
 	void processTLSRuntime()
 	{
 		auto& func = processEmptyFunc(mTLSRuntime.address(), "tlsRuntime"); // everything there is done by filter
-		ensure(func.exceptionHandlers.size() == 1);
 
-		auto* filter = mFuncTable.entries().find(func.exceptionHandlers[0]);
-		ensure(filter && filter->value.analyzed->refs.size() == 1);
+		auto& sehHandlers = mFuncTable.entries().find(mTLSRuntime.address())->value.exceptionHandlers;
+		ensure(sehHandlers.size() == 1);
 
-		auto& impl = processWrapperFunc(filter->value.analyzed->refs[0].ref, "tlsRuntimeFilter");
+		ResolvedAddress<Section::Text> filter;
+		resolveRefs(mFuncTable.analyze(sehHandlers[0], "tlsRuntimeSEHFilter").refs, filter);
+
+		auto& impl = processWrapperFunc(filter.address(), "tlsRuntimeFilter");
 		// TODO: deal with it all...
 		ensure(std::ranges::all_of(impl.refs, [&](const auto& ref) { return ref.ref == mObfuscate.address() || !sectionText().contains(ref.ref); }));
+	}
+
+	void processBootstrapJunk()
+	{
+		// there are a bunch of SEH entries pointing to bootstrap area with bad data; replace all that with simple dummy functions to help out IDA
+		auto it = mFuncTable.entries().findNext(mVEHMain.address());
+		ensure(it != mFuncTable.entries().end() && it->value.analyzed); // impl
+		++it;
+		auto limit = mBinary.entryPoint();
+		int index = 0;
+		const u8 patch[] = { 0xC3 }; // ret
+		while (it != mFuncTable.entries().end() && it->begin < limit)
+		{
+			ensure(!it->value.analyzed && it->value.seh);
+			mPatcher.patchGeneric(patch, it->begin, it->end, "fake bootstrap entry", false);
+			mFuncTable.analyze(it->begin, std::format("bootstrapDummy{}", index++));
+			++it;
+		}
 	}
 
 	FunctionData& processEmptyFunc(rva_t rva, std::string_view name)

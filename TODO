@@ -4,6 +4,16 @@
 - update to latest patch
 
 unpacker:
+- functable inserts are really slow and annoying... use std::map or something?..
+- 0x15998E7: int3 treated as ret instead... right before switch jumptable
+- automatically add unreachable blocks (ie not after jumpchain)
+-- 0x2049c0: WinMain fiber threadproc ret block after jmp to SwitchToFiber
+-- 0xB38027, 0xB4B1AF, 0xb58e4a, ...: orphan block after tail recursion jmp
+-- unreachable block in powf
+- better switches
+-- 0x87D53B: jpt size for comp is in reg initialized long time before...
+-- 0xB38ADE: switch value comparison happened *way* before...
+-- 0x189A76D, 0x189c600: again more weirdness...
 - entries for exports
 - patching instead of injection
 -- fix remapped section state checks

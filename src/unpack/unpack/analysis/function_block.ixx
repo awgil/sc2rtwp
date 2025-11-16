@@ -26,6 +26,15 @@ export struct Function
 	auto findInstruction(this auto&& self, i32 rva) { return std::ranges::find_if(instructions, [rva](const auto& ins) { return ins.rva == rva; }); }
 };
 
+struct SwitchMetadata
+{
+	i32 rvaJmp; // jmp reg instruction
+	i32 rvaJumpTable;
+	i32 sizeJumpTable;
+	i32 rvaIndirectTable;
+	i32 sizeIndirectTable;
+};
+
 // debug logging
 enum class LogLevel { None, Important, Verbose };
 Logger log{ "FuncBlock", LogLevel::None };
@@ -61,7 +70,9 @@ public:
 		mInstructions.clear();
 		mBlocks.clear();
 		mSwitchBlocks.clear();
+		mSwitchMeta.clear();
 		mPendingBlockStarts.clear();
+		mPendingSwitches.clear();
 	}
 
 	// start new incremental analysis
@@ -160,10 +171,11 @@ private:
 		{
 			auto& ins = mInstructions.emplace_back(disasmResolveJumpChains(mBytes, newBlock.end));
 			newBlock.end += ins.length;
-			if (ins.mnem == X86_INS_RET || ins.mnem == X86_INS_INT && ins.ops[0] == 0x29)
+			if (ins.mnem == X86_INS_RET)
 			{
+				// note: IDA treats int 0x29 (fastfail) as noreturn, but it seems there's code emitted after...
 				logIns(LogLevel::Verbose, ins, "ret");
-				break; // ret or int 0x29 end the final blocks of the function
+				break; // ret ends the final blocks of the function
 			}
 			else if (ins.mnem == X86_INS_JMP)
 			{
@@ -224,7 +236,6 @@ private:
 	bool analyzeSwitch(i32 rva)
 	{
 		log(LogLevel::Important, "> analyzing switch at {:X}", rva);
-		// try to process switch
 		// <predecessor block>:
 		//   cmp reg1, limit
 		//   jbe <cur block> - or ja <default block>
@@ -235,6 +246,7 @@ private:
 		//   mov reg3, dword ptr [reg2 + 4 * reg1 + jumptable_rva] - note that reg2/reg3 might as well be swapped here...
 		//   add reg3, reg2 - note that sometimes imagebase is reloaded again into a different reg before this...
 		//   jmp reg3
+		SwitchMetadata meta{ rva };
 		auto block = mBlocks.getPrevIfContains(mBlocks.findNext(rva), rva);
 		ensure(block != mBlocks.end());
 		auto blockIns = instructions(*block);
@@ -262,18 +274,17 @@ private:
 		ensure(iIns != blockIns.rend());
 		ensure(iIns->ops[1].mem.scale == 4);
 		auto indexReg = iIns->ops[1].mem.index;
-		auto jumpTableRVA = iIns->ops[1].mem.displacement;
+		meta.rvaJumpTable = iIns->ops[1].mem.displacement;
 
 		// now look for optional indirect table load: movzx index32, byte [imagebase + indirect + indirectTableRVA]
 		while (++iIns != blockIns.rend())
 			if (iIns->mnem == X86_INS_MOVZX && iIns->ops[0].type == x86::OpType::Reg && iIns->ops[0].reg.gprIndex() == indexReg.gprIndex() && iIns->ops[1].type == x86::OpType::Mem)
 				break;
-		i32 indirectTableRVA = 0;
 		if (iIns != blockIns.rend())
 		{
 			ensure(iIns->ops[1].size == 1 && iIns->ops[1].mem.scale == 1);
 			indexReg = iIns->ops[1].mem.index;
-			indirectTableRVA = iIns->ops[1].mem.displacement;
+			meta.rvaIndirectTable = iIns->ops[1].mem.displacement;
 		}
 
 		// finally, find the jump table size - one of the predecessor blocks should have a jcc
@@ -283,32 +294,50 @@ private:
 			if (!std::ranges::contains(b.successors, block->begin))
 				continue; // not a predecessor
 			log(LogLevel::Verbose, ">> considering predecessor {:X}", b.begin);
-			if (b.insCount() < 2)
-				continue; // can't have cmp + jcc
 			auto prevIns = instructions(b);
 			iIns = prevIns.rbegin();
-			if (iIns->mnem != X86_INS_JBE && iIns->mnem != X86_INS_JA)
-				continue; // TODO: can it be something else? like jb?
-			++iIns;
-			ensure(iIns->mnem == X86_INS_CMP && iIns->ops[0].type == x86::OpType::Reg /*&& iIns->ops[0].reg.gprIndex() == indexReg.gprIndex()*/ && iIns->ops[1].type == x86::OpType::Imm); // TODO: there could be renamings of index reg that we've skipped
-			auto jumpTableSize = iIns->ops[1].immediate<i32>() + 1;
-			if (indirectTableRVA)
+			ensure(iIns != prevIns.rend()); // block with no instructions can't be a predecessor...
+			if (iIns->mnem == X86_INS_JBE || iIns->mnem == X86_INS_JA) // TODO: can it be something else, like jb?
 			{
-				// the size is actually of the indirect table
-				auto indirectTableSize = jumpTableSize;
-				mSwitchBlocks.push_back({ indirectTableRVA, indirectTableRVA + indirectTableSize });
-				jumpTableSize = 0;
-				for (int i = 0; i < indirectTableSize; ++i)
-					jumpTableSize = std::max(jumpTableSize, mBytes[indirectTableRVA + i] + 1);
-				log(LogLevel::Verbose, ">> found indirect switch at [{:X}] {:X}: indirect table at {:X}, size {}, jump table at {:X}, size {}", block->begin, rva, indirectTableRVA, indirectTableSize, jumpTableRVA, jumpTableSize);
+				// this is what we're looking for - the block that checks switch variable against limit
+				ensure(iIns->ops[0].type == x86::OpType::Imm);
+				++iIns;
+				ensure(iIns != prevIns.rend());
+				ensure(iIns->mnem == X86_INS_CMP && iIns->ops[0].type == x86::OpType::Reg /*&& iIns->ops[0].reg.gprIndex() == indexReg.gprIndex()*/ && iIns->ops[1].type == x86::OpType::Imm); // TODO: there could be renamings of index reg that we've skipped
+				if (meta.rvaIndirectTable)
+				{
+					// the size is actually of the indirect table
+					meta.sizeIndirectTable = iIns->ops[1].immediate<i32>() + 1;
+					mSwitchBlocks.push_back({ meta.rvaIndirectTable, meta.rvaIndirectTable + meta.sizeIndirectTable });
+					for (int i = 0; i < meta.sizeIndirectTable; ++i)
+						meta.sizeJumpTable = std::max(meta.sizeJumpTable, mBytes[meta.rvaIndirectTable + i] + 1);
+					log(LogLevel::Verbose, ">> found indirect switch at [{:X}] {:X}: indirect table at {:X}, size {}, jump table at {:X}, size {}", block->begin, rva, meta.rvaIndirectTable, meta.sizeIndirectTable, meta.rvaJumpTable, meta.sizeJumpTable);
+				}
+				else
+				{
+					meta.sizeJumpTable = iIns->ops[1].immediate<i32>() + 1;
+					log(LogLevel::Verbose, ">> found direct switch at [{:X}] {:X}: jump table at {:X}, size {}", block->begin, rva, meta.rvaJumpTable, meta.sizeJumpTable);
+				}
+			}
+			else if (iIns->mnem == X86_INS_JMP && iIns->ops[0].type == x86::OpType::Reg)
+			{
+				// nested switch on the same variable, this is cursed...
+				ensure(!meta.rvaIndirectTable); // only direct
+				auto parentSwitch = std::ranges::find_if(mSwitchMeta, [&](const auto& meta) { return meta.rvaJmp == iIns->rva; });
+				ensure(parentSwitch != mSwitchMeta.end() && !parentSwitch->rvaIndirectTable);
+				log(LogLevel::Verbose, ">> found nested direct-direct switch at [{:X}] {:X}, parent at {:X}", block->begin, rva, parentSwitch->rvaJmp);
+				meta.sizeJumpTable = parentSwitch->sizeJumpTable;
 			}
 			else
 			{
-				log(LogLevel::Verbose, ">> found direct switch at [{:X}] {:X}: jump table at {:X}, size {}", block->begin, rva, jumpTableRVA, jumpTableSize);
+				// continue looking...
+				continue;
 			}
-			mSwitchBlocks.push_back({ jumpTableRVA, jumpTableRVA + jumpTableSize * 4 });
-			auto jumpTable = reinterpret_cast<const i32*>(mBytes.data() + jumpTableRVA);
-			for (int i = 0; i < jumpTableSize; ++i)
+
+			mSwitchBlocks.push_back({ meta.rvaJumpTable, meta.rvaJumpTable + meta.sizeJumpTable * 4 });
+			mSwitchMeta.push_back(meta);
+			auto jumpTable = reinterpret_cast<const i32*>(mBytes.data() + meta.rvaJumpTable);
+			for (int i = 0; i < meta.sizeJumpTable; ++i)
 			{
 				auto target = jumpTable[i];
 				log(LogLevel::Verbose, ">> branch {} = {:X}", i, target);
@@ -331,6 +360,7 @@ private:
 	std::vector<x86::Instruction> mInstructions;
 	RangeMap<FunctionBlock> mBlocks;
 	std::vector<FunctionBlock> mSwitchBlocks;
+	std::vector<SwitchMetadata> mSwitchMeta;
 	std::vector<i32> mPendingBlockStarts; // blocks to be analyzed
 	std::vector<i32> mPendingSwitches; // rvas of candidates to switch jumps
 };
