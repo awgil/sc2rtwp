@@ -4,8 +4,6 @@
 - update to latest patch
 
 unpacker:
-- improve switch tables detection in funcblocks
--- move to separate analyzer
 - entries for exports
 - patching instead of injection
 -- fix remapped section state checks

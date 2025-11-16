@@ -80,11 +80,23 @@ public:
 		ensure(inProgress());
 		ensure(rva >= mCurStart && rva < mCurLimit);
 		mPendingBlockStarts.push_back(rva);
-		while (!mPendingBlockStarts.empty())
+		while (mPendingBlockStarts.size() + mPendingSwitches.size() > 0)
 		{
-			auto rva = mPendingBlockStarts.back();
-			mPendingBlockStarts.pop_back();
-			analyzeBlock(rva);
+			// note that we only want to start processing switches when all other blocks are analyzed
+			// this is because we need to know all predecessors for a block containing the switch jump, so that we can accurately determine jump table size
+			while (!mPendingBlockStarts.empty())
+			{
+				auto rva = mPendingBlockStarts.back();
+				mPendingBlockStarts.pop_back();
+				analyzeBlock(rva);
+			}
+			while (!mPendingSwitches.empty())
+			{
+				auto rva = mPendingSwitches.back();
+				mPendingSwitches.pop_back();
+				if (analyzeSwitch(rva))
+					break; // on success, process all normal blocks before continuing to process switches
+			}
 		}
 	}
 
@@ -203,53 +215,83 @@ private:
 		}
 		else if (ins.ops[0].type == x86::OpType::Reg)
 		{
-			// try to process switch
-			// variant 1 (direct table):
-			// <predecessor block>:
-			//   cmp reg1, limit
-			//   jbe <cur block> - or ja <default block>
-			// <cur block>:
-			//   [potentially some unrelated instructions]
-			//   lea reg2, imagebase - might be optional? if it's already in register for unrelated reason
-			//   mov reg3, dword ptr [reg2 + 4 * reg1 + jumptable_rva] - note that reg2/reg3 might as well be swapped here...
-			//   add reg3, reg2
-			//   jmp reg3
-			auto branchReg = ins.ops[0].reg;
-			ensure(branchReg.isGPR64());
-			auto prevIns = &ins - 1;
-			auto curBlockStart = &mInstructions[block.insBegin];
-			while (prevIns >= curBlockStart && !(prevIns->mnem == X86_INS_ADD && prevIns->ops[0] == branchReg && prevIns->ops[1].type == x86::OpType::Reg))
-				--prevIns;
-			if (prevIns < curBlockStart)
-				return; // not a switch statement
-			auto imagebaseReg = prevIns->ops[1].reg;
-			--prevIns;
-			while (prevIns >= curBlockStart && !(prevIns->mnem == X86_INS_MOV && prevIns->ops[1].type == x86::OpType::Mem && prevIns->ops[0].type == x86::OpType::Reg && prevIns->ops[0].reg.isGPR32() && (prevIns->ops[0].reg.gprIndex() == branchReg.gprIndex() || prevIns->ops[0].reg.gprIndex() == imagebaseReg.gprIndex())))
-				--prevIns;
-			ensure(prevIns >= curBlockStart);
-			if (prevIns->ops[0].reg.gprIndex() == imagebaseReg.gprIndex())
-				std::swap(branchReg, imagebaseReg);
-			ensure(prevIns->ops[1].mem.base == imagebaseReg && prevIns->ops[1].mem.scale == 4);
-			auto indexReg = prevIns->ops[1].mem.index;
-			auto jumpTableRVA = prevIns->ops[1].mem.displacement;
-			// now look for optional indirect table load: movzx index32, byte [imagebase + indirect + indirectTableRVA]
-			--prevIns;
-			while (prevIns >= curBlockStart && !(prevIns->mnem == X86_INS_MOVZX && prevIns->ops[0].type == x86::OpType::Reg && prevIns->ops[0].reg.gprIndex() == indexReg.gprIndex() && prevIns->ops[1].type == x86::OpType::Mem))
-				--prevIns;
-			i32 indirectTableRVA = 0;
-			if (prevIns >= curBlockStart)
-			{
-				ensure(prevIns->ops[1].size == 1 && prevIns->ops[1].mem.scale == 1);
-				indexReg = prevIns->ops[1].mem.index;
-				indirectTableRVA = prevIns->ops[1].mem.displacement;
-			}
-			auto prevBlock = std::ranges::find_if(mBlocks, [&](const auto& b) { return std::ranges::contains(b.successors, block.begin); });
-			ensure(prevBlock != mBlocks.end() && prevBlock->insCount() > 1);
-			auto& prevBlockJcc = instructions(*prevBlock).back();
-			ensure(prevBlockJcc.mnem == X86_INS_JBE || prevBlockJcc.mnem == X86_INS_JA); // TODO: can it be something else? like jb?
-			auto prevBlockCmp = &prevBlockJcc - 1;
-			ensure(prevBlockCmp->mnem == X86_INS_CMP && prevBlockCmp->ops[0].type == x86::OpType::Reg /*&& prevBlockCmp->ops[0].reg.gprIndex() == indexReg.gprIndex()*/ && prevBlockCmp->ops[1].type == x86::OpType::Imm); // TODO: there could be renamings of index reg that we've skipped
-			auto jumpTableSize = prevBlockCmp->ops[1].immediate<i32>() + 1;
+			// delay processing switches until all pending blocks are processed
+			mPendingSwitches.push_back(ins.rva);
+		}
+		// else: jmp [mem], ignore?.. this is used for stuff like export thunks...
+	}
+
+	bool analyzeSwitch(i32 rva)
+	{
+		log(LogLevel::Important, "> analyzing switch at {:X}", rva);
+		// try to process switch
+		// <predecessor block>:
+		//   cmp reg1, limit
+		//   jbe <cur block> - or ja <default block>
+		// <cur block>:
+		//   [potentially some unrelated instructions]
+		//   lea reg2, imagebase - might be optional? if it's already in register for unrelated reason
+		//   movzx reg1, byte ptr [reg2 + reg1 + indirect_rva] - optional, for tables with indirection
+		//   mov reg3, dword ptr [reg2 + 4 * reg1 + jumptable_rva] - note that reg2/reg3 might as well be swapped here...
+		//   add reg3, reg2 - note that sometimes imagebase is reloaded again into a different reg before this...
+		//   jmp reg3
+		auto block = mBlocks.getPrevIfContains(mBlocks.findNext(rva), rva);
+		ensure(block != mBlocks.end());
+		auto blockIns = instructions(*block);
+		auto iIns = blockIns.rbegin();
+		ensure(iIns != blockIns.rend() && iIns->rva == rva && iIns->mnem == X86_INS_JMP && iIns->ops[0].type == x86::OpType::Reg);
+		auto branchReg = iIns->ops[0].reg;
+		ensure(branchReg.isGPR64()); // expected to contain VA of the case
+
+		// find add that converts case RVA from jump table into VA
+		while (++iIns != blockIns.rend())
+			if (iIns->mnem == X86_INS_ADD && iIns->ops[0] == branchReg && iIns->ops[1].type == x86::OpType::Reg)
+				break;
+		if (iIns == blockIns.rend())
+		{
+			log(LogLevel::Verbose, ">> not found 'add jumptable, imagebase'");
+			return false; // not a switch statement
+		}
+		auto imagebaseReg = iIns->ops[1].reg; // note: imagebase and branch could be swapped
+
+		// find mov that loads case RVA from jump table
+		// TODO: theoretically there could be a mov that changes the register we're looking for...
+		while (++iIns != blockIns.rend())
+			if (iIns->mnem == X86_INS_MOV && iIns->ops[1].type == x86::OpType::Mem && iIns->ops[0].type == x86::OpType::Reg && iIns->ops[0].reg.isGPR32() && (iIns->ops[0].reg.gprIndex() == branchReg.gprIndex() || iIns->ops[0].reg.gprIndex() == imagebaseReg.gprIndex()))
+				break;
+		ensure(iIns != blockIns.rend());
+		ensure(iIns->ops[1].mem.scale == 4);
+		auto indexReg = iIns->ops[1].mem.index;
+		auto jumpTableRVA = iIns->ops[1].mem.displacement;
+
+		// now look for optional indirect table load: movzx index32, byte [imagebase + indirect + indirectTableRVA]
+		while (++iIns != blockIns.rend())
+			if (iIns->mnem == X86_INS_MOVZX && iIns->ops[0].type == x86::OpType::Reg && iIns->ops[0].reg.gprIndex() == indexReg.gprIndex() && iIns->ops[1].type == x86::OpType::Mem)
+				break;
+		i32 indirectTableRVA = 0;
+		if (iIns != blockIns.rend())
+		{
+			ensure(iIns->ops[1].size == 1 && iIns->ops[1].mem.scale == 1);
+			indexReg = iIns->ops[1].mem.index;
+			indirectTableRVA = iIns->ops[1].mem.displacement;
+		}
+
+		// finally, find the jump table size - one of the predecessor blocks should have a jcc
+		// note that some predecessors could set the case variable to a constant guaranteed to be in range and skip the bounds check!
+		for (const auto& b : mBlocks)
+		{
+			if (!std::ranges::contains(b.successors, block->begin))
+				continue; // not a predecessor
+			log(LogLevel::Verbose, ">> considering predecessor {:X}", b.begin);
+			if (b.insCount() < 2)
+				continue; // can't have cmp + jcc
+			auto prevIns = instructions(b);
+			iIns = prevIns.rbegin();
+			if (iIns->mnem != X86_INS_JBE && iIns->mnem != X86_INS_JA)
+				continue; // TODO: can it be something else? like jb?
+			++iIns;
+			ensure(iIns->mnem == X86_INS_CMP && iIns->ops[0].type == x86::OpType::Reg /*&& iIns->ops[0].reg.gprIndex() == indexReg.gprIndex()*/ && iIns->ops[1].type == x86::OpType::Imm); // TODO: there could be renamings of index reg that we've skipped
+			auto jumpTableSize = iIns->ops[1].immediate<i32>() + 1;
 			if (indirectTableRVA)
 			{
 				// the size is actually of the indirect table
@@ -258,24 +300,28 @@ private:
 				jumpTableSize = 0;
 				for (int i = 0; i < indirectTableSize; ++i)
 					jumpTableSize = std::max(jumpTableSize, mBytes[indirectTableRVA + i] + 1);
-				log(LogLevel::Important, "> found indirect switch at [{:X}] {:X}: indirect table at {:X}, size {}, jump table at {:X}, size {}", block.begin, ins.rva, indirectTableRVA, indirectTableSize, jumpTableRVA, jumpTableSize);
+				log(LogLevel::Verbose, ">> found indirect switch at [{:X}] {:X}: indirect table at {:X}, size {}, jump table at {:X}, size {}", block->begin, rva, indirectTableRVA, indirectTableSize, jumpTableRVA, jumpTableSize);
 			}
 			else
 			{
-				log(LogLevel::Important, "> found direct switch at [{:X}] {:X}: jump table at {:X}, size {}", block.begin, ins.rva, jumpTableRVA, jumpTableSize);
+				log(LogLevel::Verbose, ">> found direct switch at [{:X}] {:X}: jump table at {:X}, size {}", block->begin, rva, jumpTableRVA, jumpTableSize);
 			}
 			mSwitchBlocks.push_back({ jumpTableRVA, jumpTableRVA + jumpTableSize * 4 });
 			auto jumpTable = reinterpret_cast<const i32*>(mBytes.data() + jumpTableRVA);
 			for (int i = 0; i < jumpTableSize; ++i)
 			{
 				auto target = jumpTable[i];
-				log(LogLevel::Important, ">> branch {} = {:X}", i, target);
+				log(LogLevel::Verbose, ">> branch {} = {:X}", i, target);
 				ensure(target >= mCurStart && target < mCurLimit);
-				block.successors.push_back(target);
+				mBlocks.edit(block).successors.push_back(target);
 				mPendingBlockStarts.push_back(target);
 			}
+			return true;
 		}
-		// else: jmp [mem], ignore?.. this is used for stuff like export thunks...
+
+		// we didn't find the good predecessor...
+		__debugbreak();
+		return false;
 	}
 
 private:
@@ -286,6 +332,7 @@ private:
 	RangeMap<FunctionBlock> mBlocks;
 	std::vector<FunctionBlock> mSwitchBlocks;
 	std::vector<i32> mPendingBlockStarts; // blocks to be analyzed
+	std::vector<i32> mPendingSwitches; // rvas of candidates to switch jumps
 };
 
 

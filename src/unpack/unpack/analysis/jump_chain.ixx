@@ -120,7 +120,6 @@ bool isFlagsOnly(const x86::Instruction& ins)
 bool isJmpRel(const x86::Instruction& ins) { return ins.mnem == X86_INS_JMP && ins.ops[0].type == x86::OpType::Imm; }
 bool isJccRel(const x86::Instruction& ins) { return ins.mnem.isConditionalJump() && ins.ops[0].type == x86::OpType::Imm; }
 i32 relTarget(const x86::Instruction& ins) { return ins.ops[0].immediate<i32>(); }
-bool isJccConditionNormal(x86::Condition cond) { return cond != x86::Condition::PF; } // this condition doesn't appear in normal code (note that OF & SF are also quite rare, but still legitimate)
 bool isTestConditionNormal(x86::Condition cond) { return cond == x86::Condition::ZF || cond == x86::Condition::CZ || cond == x86::Condition::LE || cond == x86::Condition::SF; } // these condition are meaningful after test (SF is proxy for SO, for < 0)
 
 // update condition state for specific instruction
@@ -335,6 +334,7 @@ i32 findJumpChainTarget(std::span<const u8> imageBytes, const x86::Instruction& 
 	{
 		log(LogLevel::Important, "Starting from {:X} (jcc)", ins.rva);
 		logIns(LogLevel::Verbose, ins, "jcc", nesting);
+		// note: all conditions can legitimately appear in the code; SF and OF are somewhat rare, and PF is even more rare (used for float comparison to signify unordered result)
 		auto icc = ins.mnem.conditionCode();
 		auto next = disasmNextNonNop(imageBytes, ins.endRVA(), nesting);
 		if (!isJccRel(next))
@@ -344,7 +344,6 @@ i32 findJumpChainTarget(std::span<const u8> imageBytes, const x86::Instruction& 
 			// in obfuscation, theoretically the second branch could start with a jmp rather than jncc, can it happen?
 			// note that if next is flags-only, it could be jcc followed by a jump chain (or theoretically recursive jumpchain)
 			logIns(LogLevel::Verbose, next, "uninteresting", nesting);
-			ensure(isJccConditionNormal(icc.condition()));
 			return 0;
 		}
 		else if (auto jcc = next.mnem.conditionCode(); jcc.condition() != icc.condition() || jcc.negated() == icc.negated())
@@ -352,7 +351,6 @@ i32 findJumpChainTarget(std::span<const u8> imageBytes, const x86::Instruction& 
 			// jcc->jcc or jcc1->jcc2, likely first jcc is normal, and second starts jump chain
 			// technically this could also happen if one of the braches has a recursive chain, can it happen?
 			logIns(LogLevel::Verbose, next, "mismatching jcc sequence", nesting);
-			ensure(isJccConditionNormal(icc.condition()));
 			return 0;
 		}
 		else
