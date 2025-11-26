@@ -19,8 +19,6 @@ export struct Function
 	std::vector<x86::Instruction> instructions; // sorted by rva
 	RangeMap<FunctionBlock> blocks;
 
-	i32 begin() const { return blocks.front().begin; }
-	i32 end() const { return blocks.back().end; }
 	auto blockInstructions(this auto&& self, const FunctionBlock& block) { return std::span(self.instructions).subspan(block.insBegin, block.insCount()); }
 	auto blockInstructions(this auto&& self, int blockIndex) { return self.blockInstructions(self.blocks[blockIndex]); }
 	auto findInstruction(this auto&& self, i32 rva) { return std::ranges::find_if(instructions, [rva](const auto& ins) { return ins.rva == rva; }); }

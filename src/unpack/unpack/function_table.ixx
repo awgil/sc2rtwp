@@ -18,19 +18,19 @@ export enum class FunctionType
 	CatchBlock, // C++ catch block, outlined, IDA considers it to be a chunk, returns continuation point in owning function
 };
 
-export struct FunctionData : analysis::Function
+export struct FunctionInfo : analysis::Function
 {
+	rva_t begin;
+	rva_t end;
+	std::string name;
 	std::vector<analysis::Reference> refs;
-};
-
-export struct FunctionTableEntryInfo
-{
-	std::unique_ptr<FunctionData> analyzed; // TODO: this is annoying - we really need to support analyzing new functions recursively though, meaning either this or diffent container that doesn't invalidate iterators...
 	const SEHInfo::Entry* seh = nullptr;
 	FunctionType type = FunctionType::Normal;
 	rva_t parent = 0; // relevant for special functions
 	std::vector<rva_t> extraEntryPoints;
 	std::vector<rva_t> exceptionHandlers; // note: external functions (eg. SEH filters, catch blocks, unwind funclets)
+
+	bool isAnalyzed() const { return !blocks.empty(); }
 };
 
 // table describing .text layout of the binary
@@ -38,9 +38,6 @@ export struct FunctionTableEntryInfo
 export class FunctionTable
 {
 public:
-	using Entries = NamedRangeMap<rva_t, FunctionTableEntryInfo>;
-	using Entry = Entries::Entry;
-
 	FunctionTable(PEBinary& binary, const PEBinary::Section& text, Patcher& patcher)
 		: mBinary(binary)
 		, mFBA(binary.bytes())
@@ -77,13 +74,14 @@ public:
 		funcStarts.erase(dupes.begin(), dupes.end());
 
 		// create entries for functions covered by SEH & reloc
-		// do that in order, to prevent costly reallocations when functions are inserted in the middle of the table
-		mTable.reserve(binary.sehEntries().size() + funcStarts.size());
+		// do that in order, so that we can use emplace_hint
 		auto iFunc = funcStarts.begin();
 		auto insertFuncsUpTo = [&](rva_t rva) {
 			while (iFunc != funcStarts.end() && *iFunc < rva)
 			{
-				mTable.insert({ *iFunc, *iFunc + 1 }, mTable.end());
+				auto it = mTable.try_emplace(mTable.end(), *iFunc);
+				it->second.begin = *iFunc;
+				it->second.end = *iFunc + 1;
 				++iFunc;
 			}
 		};
@@ -91,42 +89,57 @@ public:
 		{
 			// TODO: ignore if this entry covers catch block of other function?.. it has a ref to the middle of other func
 			insertFuncsUpTo(seh.begin);
-			mTable.insert({ seh.begin, seh.end, {}, { {}, &seh } }, mTable.end());
+			auto it = mTable.try_emplace(mTable.end(), seh.begin);
+			it->second.begin = seh.begin;
+			it->second.end = seh.end;
+			it->second.seh = &seh;
 			if (iFunc != funcStarts.end() && *iFunc == seh.begin)
 				++iFunc;
+			ensure(iFunc == funcStarts.end() || *iFunc >= seh.end);
 		}
 		insertFuncsUpTo(std::numeric_limits<rva_t>::max());
 	}
 
 	// analyze single function that is assumed to be never analyzed before
 	// all the exception handlers are also analyzed automatically (but not stuff they call)
-	FunctionData& analyze(rva_t rva, std::string_view name, auto&& analyzeFunc)
+	FunctionInfo& analyze(rva_t rva, std::string_view name, auto&& analyzeFunc)
 	{
-		auto [existing, isNew] = getOrCreateEntry(rva);
-		ensure(existing->name.empty() && !existing->value.analyzed); // should never have been analyzed before
+		auto [it, isNew] = getOrCreateEntry(rva);
+		auto& e = it->second;
+		ensure(e.name.empty() && !e.isAnalyzed()); // should never have been analyzed before
 		logger(LogLevel::Verbose, "Processing {} function '{}' at {:X}...", isNew ? "new" : "known", name, rva);
-		mTable.edit(existing).name = name;
-		auto& res = *(mTable.edit(existing).value.analyzed = std::make_unique<FunctionData>());
-		auto next = existing + 1;
-		auto seh = existing->value.seh;
-		res = analyzeFunc(mFBA, rva, seh ? seh->end : next != mTable.end() ? next->begin : mTextEnd, existing->value.extraEntryPoints);
-		auto limit = seh ? seh->end : res.end();
-		if (existing->value.type == FunctionType::SEHFilter && limit == res.end() + 1)
+		e.name = name;
+
+		auto res = analyzeFunc(mFBA, rva, guessFunctionLimit(it), e.extraEntryPoints);
+		e.blocks = std::move(res.blocks);
+		e.instructions = std::move(res.instructions);
+
+		auto limit = e.seh ? e.seh->end : e.blocks.back().end;
+		if (e.type == FunctionType::SEHFilter && limit == e.blocks.back().end + 1)
 		{
 			// TODO: for whatever reason, some SEH filters have SEH entry covering one byte more than is real...
 			--limit;
 			__debugbreak();
 		}
-		mPatcher.patchFunction(res, limit);
-		res.refs = analysis::getSimpleRefs(res.instructions);
-		if (res.end() > existing->end)
-			mTable.extend(existing->end, res.end(), next);
-		return res;
+		mPatcher.patchFunction(e, limit);
+
+		e.refs = analysis::getSimpleRefs(e.instructions);
+
+		e.end = std::max(e.end, limit);
+		if (limit > e.end)
+		{
+			e.end = limit;
+			auto next = it;
+			++next;
+			ensure(next == mTable.end() || limit <= next->first);
+		}
+
+		return e;
 	}
 
 	auto& analyze(rva_t rva, std::string_view name)
 	{
-		return analyze(rva, name, [&](analysis::FunctionBlockAnalysis<FunctionData>& analyzer, rva_t begin, rva_t limit, std::span<const rva_t> extraBlocks) {
+		return analyze(rva, name, [&](analysis::FunctionBlockAnalysis<>& analyzer, rva_t begin, rva_t limit, std::span<const rva_t> extraBlocks) {
 			analyzer.start(begin, limit);
 			analyzer.scheduleAndAnalyze(begin);
 			for (auto rva : extraBlocks)
@@ -137,37 +150,38 @@ public:
 
 	void analyzeSEHHandlers()
 	{
-		std::vector<rva_t> handlerRVAs;
+		std::vector<std::reference_wrapper<FunctionInfo>> handlers;
+		auto isKnownHandler = [&](rva_t rva) { return std::ranges::contains(handlers, rva, [](const FunctionInfo& h) { return h.begin; }); };
+
 		for (auto& seh : mBinary.sehEntries())
-			if (seh.value.rva && !std::ranges::contains(handlerRVAs, seh.value.rva))
-				handlerRVAs.push_back(seh.value.rva);
-		ensure(handlerRVAs.size() == 4); // these are all library ones - note that SC2 doesn't have the __GSHandlerCheck_SEH variant...
-		auto handlers = handlerRVAs | std::views::transform([&](rva_t rva) -> auto& { return analyze(rva, ""); }) | std::ranges::to<std::vector<std::reference_wrapper<FunctionData>>>();
+			if (seh.value.rva && !isKnownHandler(seh.value.rva))
+				handlers.push_back(analyze(seh.value.rva, ""));
+		ensure(handlers.size() == 4); // these are all library ones - note that SC2 doesn't have the __GSHandlerCheck_SEH variant...
 		// heuristics to classify handlers...
-		for (FunctionData& handler : handlers)
+		for (FunctionInfo& handler : handlers)
 		{
 			switch (handler.refs.size())
 			{
 			case 1:
 				// this one simply calls __GSHandlerCheckCommon
-				logger(LogLevel::Important, "SEH handler at {:X} = __GSHandlerCheck", handler.begin());
+				logger(LogLevel::Important, "SEH handler at {:X} = __GSHandlerCheck", handler.begin);
 				break;
 			case 2:
 				// this one calls __GSHandlerCheckCommon and __CxxFrameHandler3
-				ensure(std::ranges::contains(handlerRVAs, handler.refs[1].ref));
-				mGSHandlerCheckEH = handler.begin();
-				logger(LogLevel::Important, "SEH handler at {:X} = __GSHandlerCheck_EH", handler.begin());
+				ensure(isKnownHandler(handler.refs[1].ref));
+				mGSHandlerCheckEH = handler.begin;
+				logger(LogLevel::Important, "SEH handler at {:X} = __GSHandlerCheck_EH", handler.begin);
 				break;
 			case 4:
 				// this one calls __vcrt_getptd 3x and then __InternalCxxFrameHandler
 				ensure(handler.refs[1].ref == handler.refs[0].ref && handler.refs[2].ref == handler.refs[0].ref);
-				mCxxFrameHandler = handler.begin();
-				logger(LogLevel::Important, "SEH handler at {:X} = __CxxFrameHandler3", handler.begin());
+				mCxxFrameHandler = handler.begin;
+				logger(LogLevel::Important, "SEH handler at {:X} = __CxxFrameHandler3", handler.begin);
 				break;
 			case 8:
 				// this one calls a whole lot of shit
-				mCSpecificHandler = handler.begin();
-				logger(LogLevel::Important, "SEH handler at {:X} = __C_specific_handler", handler.begin());
+				mCSpecificHandler = handler.begin;
+				logger(LogLevel::Important, "SEH handler at {:X} = __C_specific_handler", handler.begin);
 				break;
 			default:
 				__debugbreak();
@@ -217,8 +231,8 @@ public:
 				continue; // some handler we don't care about, don't bother doing the lookup etc
 			}
 
-			auto& parentFunc = editExisting(seh.begin);
-			ensure(!parentFunc.analyzed && parentFunc.extraEntryPoints.empty() && parentFunc.exceptionHandlers.empty());
+			auto& parentFunc = mTable[seh.begin];
+			ensure(parentFunc.begin == seh.begin && !parentFunc.isAnalyzed() && parentFunc.extraEntryPoints.empty() && parentFunc.exceptionHandlers.empty());
 			parentFunc.extraEntryPoints = std::move(extraBlocks);
 			parentFunc.exceptionHandlers = std::move(externalFuncs);
 			ensure(extraBlocks.empty() && externalFuncs.empty());
@@ -229,20 +243,22 @@ public:
 	{
 		std::vector<rva_t> pending, nextIteration;
 		pending.reserve(mTable.size());
-		for (auto& func : mTable)
-			if (!func.value.analyzed)
+		for (auto& [_, func] : mTable)
+			if (!func.isAnalyzed())
 				pending.push_back(func.begin);
+
 		int iPass = 0;
 		while (!pending.empty())
 		{
 			logger(LogLevel::Important, "Analyzing remaining functions: pass {}, {} functions remaining", ++iPass, pending.size());
 			for (size_t iFunc = 0; iFunc < pending.size(); ++iFunc)
 			{
-				auto [entry, isNew] = getOrCreateEntry(pending[iFunc]);
-				ensure(!isNew && !entry->value.analyzed);
-				auto needDefer = std::ranges::any_of(entry->value.exceptionHandlers, [&](rva_t secondary) {
-					auto e = ensure(mTable.find(secondary));
-					return !e->value.analyzed && e->value.type == FunctionType::CatchBlock; // catch blocks need to be analyzed first, as they have extra block refs for parent func
+				auto [it, isNew] = getOrCreateEntry(pending[iFunc]);
+				auto& entry = it->second;
+				ensure(!isNew && !entry.isAnalyzed());
+				auto needDefer = std::ranges::any_of(entry.exceptionHandlers, [&](rva_t secondary) {
+					auto& e = mTable[secondary];
+					return !e.isAnalyzed() && e.type == FunctionType::CatchBlock; // catch blocks need to be analyzed first, as they have extra block refs for parent func
 				});
 				if (needDefer)
 				{
@@ -250,15 +266,15 @@ public:
 					continue;
 				}
 
-				auto& func = analyze(pending[iFunc], "");
-				auto refs = std::span(func.refs);
-				if (entry->value.type == FunctionType::CatchBlock)
+				analyze(it->first, "");
+				auto refs = std::span(entry.refs);
+				if (entry.type == FunctionType::CatchBlock)
 				{
-					ensure(!func.refs.empty() && func.refs.back().ins->ops[0] == x86::Reg::rax);
-					auto& parent = editExisting(entry->value.parent);
-					ensure(!parent.analyzed);
-					parent.extraEntryPoints.push_back(func.refs.back().ref);
-					refs = refs.subspan(0, func.refs.size() - 1);
+					ensure(!refs.empty() && refs.back().ins->ops[0] == x86::Reg::rax);
+					auto& parent = mTable[entry.parent];
+					ensure(parent.begin == entry.parent && !parent.isAnalyzed());
+					parent.extraEntryPoints.push_back(refs.back().ref);
+					refs = refs.subspan(0, refs.size() - 1);
 				}
 
 				for (auto& ref : refs)
@@ -281,37 +297,44 @@ private:
 	auto getOrCreateEntry(rva_t rva)
 	{
 		ensure(rva >= mTextBegin && rva < mTextEnd);
-		auto next = mTable.findNext(rva);
-		auto existing = mTable.getPrevIfContains(next, rva);
-		auto isNew = existing == mTable.end();
+		auto [it, isNew] = mTable.try_emplace(rva);
 		if (isNew)
-			existing = mTable.insert({ rva, rva + 1 }, next);
-		ensure(existing->begin == rva);
-		return std::make_pair(existing, isNew);
+		{
+			it->second.begin = rva;
+			it->second.end = rva + 1;
+			if (it != mTable.begin())
+			{
+				auto prev = it;
+				ensure(--prev->second.end <= rva);
+			}
+		}
+		ensure(it->second.begin == rva);
+		return std::make_pair(it, isNew);
+	}
+
+	auto guessFunctionLimit(auto it)
+	{
+		if (it->second.seh)
+			return it->second.seh->end;
+		++it;
+		return it != mTable.end() ? it->first : mTextEnd;
 	}
 
 	auto markAsSecondary(rva_t rva, FunctionType type, rva_t parent)
 	{
-		auto& e = mTable.edit(getOrCreateEntry(rva).first);
-		ensure(!e.value.analyzed);
-		e.value.type = type;
-		e.value.parent = parent;
-	}
-
-	auto& editExisting(rva_t rva)
-	{
-		auto iter = mTable.getPrevIfContains(mTable.findNext(rva), rva);
-		ensure(iter != mTable.end() && iter->begin == rva);
-		return mTable.edit(iter).value;
+		auto& e = getOrCreateEntry(rva).first->second;
+		ensure(!e.isAnalyzed());
+		e.type = type;
+		e.parent = parent;
 	}
 
 private:
 	PEBinary& mBinary;
-	analysis::FunctionBlockAnalysis<FunctionData> mFBA;
+	analysis::FunctionBlockAnalysis<> mFBA;
 	rva_t mTextBegin;
 	rva_t mTextEnd;
 	Patcher& mPatcher;
-	Entries mTable;
+	std::map<rva_t, FunctionInfo> mTable;
 	// SEH top level handlers
 	rva_t mCSpecificHandler = 0;
 	rva_t mCxxFrameHandler = 0;

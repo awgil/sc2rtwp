@@ -188,9 +188,9 @@ public:
 			mASS.exportToIDA(exporter, "gASS");
 			mMR.exportToIDA(exporter, "gMR");
 			exporter.registerGlobalName(mShuffle.address(), "gShuffle");
-			for (auto& e : mFuncTable.entries())
-				if (e.value.analyzed)
-					exporter.registerFunction(e.value.analyzed->begin(), e.value.analyzed->end(), e.name);
+			for (auto& [_, e] : mFuncTable.entries())
+				if (e.isAnalyzed())
+					exporter.registerFunction(e.begin, e.end, e.name);
 		}
 
 		auto fixedPath = path;
@@ -387,7 +387,7 @@ private:
 		skipUninteresting();
 
 		// code that sets up two mappings to the same random region in bootstrap code
-		ensure(iRef++->ref == func.begin());
+		ensure(iRef++->ref == func.begin);
 		skipUninteresting();
 
 		resolveRef(*iRef++, mXorCloseHandle.field()); // close mapping
@@ -613,7 +613,7 @@ private:
 			0xB0, 0x01, // mov al, 1
 			0xC3, // ret
 		};
-		mPatcher.patchGeneric(replacement, func.begin(), func.end(), "decrypt import skip");
+		mPatcher.patchGeneric(replacement, func.begin, func.end, "decrypt import skip");
 	}
 
 	void processDecryptPage(rva_t rva, std::string_view tag)
@@ -664,7 +664,7 @@ private:
 	{
 		auto& func = processEmptyFunc(mTLSRuntime.address(), "tlsRuntime"); // everything there is done by filter
 
-		auto& sehHandlers = mFuncTable.entries().find(mTLSRuntime.address())->value.exceptionHandlers;
+		auto& sehHandlers = mFuncTable.entries().find(mTLSRuntime.address())->second.exceptionHandlers;
 		ensure(sehHandlers.size() == 1);
 
 		ResolvedAddress<Section::Text> filter;
@@ -678,22 +678,24 @@ private:
 	void processBootstrapJunk()
 	{
 		// there are a bunch of SEH entries pointing to bootstrap area with bad data; replace all that with simple dummy functions to help out IDA
-		auto it = mFuncTable.entries().findNext(mVEHMain.address());
-		ensure(it != mFuncTable.entries().end() && it->value.analyzed); // impl
+		auto it = mFuncTable.entries().find(mVEHMain.address());
+		ensure(it != mFuncTable.entries().end() && it->second.isAnalyzed());
+		++it;
+		ensure(it != mFuncTable.entries().end() && it->second.isAnalyzed()); // impl
 		++it;
 		auto limit = mBinary.entryPoint();
 		int index = 0;
 		const u8 patch[] = { 0xC3 }; // ret
-		while (it != mFuncTable.entries().end() && it->begin < limit)
+		while (it != mFuncTable.entries().end() && it->first < limit)
 		{
-			ensure(!it->value.analyzed && it->value.seh);
-			mPatcher.patchGeneric(patch, it->begin, it->end, "fake bootstrap entry", false);
-			mFuncTable.analyze(it->begin, std::format("bootstrapDummy{}", index++));
+			ensure(!it->second.isAnalyzed() && it->second.seh);
+			mPatcher.patchGeneric(patch, it->second.begin, it->second.end, "fake bootstrap entry", false);
+			mFuncTable.analyze(it->second.begin, std::format("bootstrapDummy{}", index++));
 			++it;
 		}
 	}
 
-	FunctionData& processEmptyFunc(rva_t rva, std::string_view name)
+	FunctionInfo& processEmptyFunc(rva_t rva, std::string_view name)
 	{
 		auto& func = mFuncTable.analyze(rva, name);
 		ensure(func.refs.empty());

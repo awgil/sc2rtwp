@@ -27,10 +27,8 @@ public:
 	// - replace parsed jump chains with real jumps
 	// - fill space between blocks (and, if end is known, between last block end and function end) with nops/int3
 	// - if doing ida-only patches, remove rbp overalign for avx (ida can't cope with it)
-	void patchFunction(analysis::Function& func, rva_t end = 0)
+	void patchFunction(analysis::Function& func, rva_t end)
 	{
-		end = end ? end : func.end(); // if not specified, just use last block end...
-
 		// patch jumps and fill space between blocks
 		u8 nop = mApplyIDAOnlyPatches ? 0x90 : 0xCC; // ida prefers nop fill, for runtime int3 allows us to find where I fucked up
 		int numPatchedJumps = 0;

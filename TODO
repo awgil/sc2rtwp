@@ -4,7 +4,6 @@
 - update to latest patch
 
 unpacker:
-- functable inserts are really slow and annoying... use std::map or something?..
 - 0x15998E7: int3 treated as ret instead... right before switch jumptable
 - automatically add unreachable blocks (ie not after jumpchain)
 -- 0x2049c0: WinMain fiber threadproc ret block after jmp to SwitchToFiber
