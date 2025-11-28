@@ -67,7 +67,6 @@ public:
 		mCurStart = mCurLimit = 0;
 		mInstructions.clear();
 		mBlocks.clear();
-		mSwitchBlocks.clear();
 		mSwitchMeta.clear();
 		mPendingBlockStarts.clear();
 		mPendingSwitches.clear();
@@ -125,8 +124,6 @@ public:
 				succ = mBlocks.findIndex(succ);
 		}
 		result.blocks = std::move(mBlocks);
-		for (auto& b : mSwitchBlocks)
-			result.blocks.insert(std::move(b));
 		clear();
 		return result;
 	}
@@ -245,9 +242,9 @@ private:
 		//   add reg3, reg2 - note that sometimes imagebase is reloaded again into a different reg before this...
 		//   jmp reg3
 		SwitchMetadata meta{ rva };
-		auto block = mBlocks.getPrevIfContains(mBlocks.findNext(rva), rva);
-		ensure(block != mBlocks.end());
-		auto blockIns = instructions(*block);
+		auto blockIndex = mBlocks.findIndex(rva);
+		ensure(blockIndex < mBlocks.size());
+		auto blockIns = instructions(mBlocks[blockIndex]);
 		auto iIns = blockIns.rbegin();
 		ensure(iIns != blockIns.rend() && iIns->rva == rva && iIns->mnem == X86_INS_JMP && iIns->ops[0].type == x86::OpType::Reg);
 		auto branchReg = iIns->ops[0].reg;
@@ -287,9 +284,10 @@ private:
 
 		// finally, find the jump table size - one of the predecessor blocks should have a jcc
 		// note that some predecessors could set the case variable to a constant guaranteed to be in range and skip the bounds check!
+		auto blockStart = mBlocks[blockIndex].begin;
 		for (const auto& b : mBlocks)
 		{
-			if (!std::ranges::contains(b.successors, block->begin))
+			if (!std::ranges::contains(b.successors, blockStart))
 				continue; // not a predecessor
 			log(LogLevel::Verbose, ">> considering predecessor {:X}", b.begin);
 			auto prevIns = instructions(b);
@@ -306,15 +304,15 @@ private:
 				{
 					// the size is actually of the indirect table
 					meta.sizeIndirectTable = iIns->ops[1].immediate<i32>() + 1;
-					mSwitchBlocks.push_back({ meta.rvaIndirectTable, meta.rvaIndirectTable + meta.sizeIndirectTable });
+					mBlocks.insert({ meta.rvaIndirectTable, meta.rvaIndirectTable + meta.sizeIndirectTable });
 					for (int i = 0; i < meta.sizeIndirectTable; ++i)
 						meta.sizeJumpTable = std::max(meta.sizeJumpTable, mBytes[meta.rvaIndirectTable + i] + 1);
-					log(LogLevel::Verbose, ">> found indirect switch at [{:X}] {:X}: indirect table at {:X}, size {}, jump table at {:X}, size {}", block->begin, rva, meta.rvaIndirectTable, meta.sizeIndirectTable, meta.rvaJumpTable, meta.sizeJumpTable);
+					log(LogLevel::Verbose, ">> found indirect switch at [{:X}] {:X}: indirect table at {:X}, size {}, jump table at {:X}, size {}", blockStart, rva, meta.rvaIndirectTable, meta.sizeIndirectTable, meta.rvaJumpTable, meta.sizeJumpTable);
 				}
 				else
 				{
 					meta.sizeJumpTable = iIns->ops[1].immediate<i32>() + 1;
-					log(LogLevel::Verbose, ">> found direct switch at [{:X}] {:X}: jump table at {:X}, size {}", block->begin, rva, meta.rvaJumpTable, meta.sizeJumpTable);
+					log(LogLevel::Verbose, ">> found direct switch at [{:X}] {:X}: jump table at {:X}, size {}", blockStart, rva, meta.rvaJumpTable, meta.sizeJumpTable);
 				}
 			}
 			else if (iIns->mnem == X86_INS_JMP && iIns->ops[0].type == x86::OpType::Reg)
@@ -323,7 +321,7 @@ private:
 				ensure(!meta.rvaIndirectTable); // only direct
 				auto parentSwitch = std::ranges::find_if(mSwitchMeta, [&](const auto& meta) { return meta.rvaJmp == iIns->rva; });
 				ensure(parentSwitch != mSwitchMeta.end() && !parentSwitch->rvaIndirectTable);
-				log(LogLevel::Verbose, ">> found nested direct-direct switch at [{:X}] {:X}, parent at {:X}", block->begin, rva, parentSwitch->rvaJmp);
+				log(LogLevel::Verbose, ">> found nested direct-direct switch at [{:X}] {:X}, parent at {:X}", blockStart, rva, parentSwitch->rvaJmp);
 				meta.sizeJumpTable = parentSwitch->sizeJumpTable;
 			}
 			else
@@ -332,7 +330,7 @@ private:
 				continue;
 			}
 
-			mSwitchBlocks.push_back({ meta.rvaJumpTable, meta.rvaJumpTable + meta.sizeJumpTable * 4 });
+			mBlocks.insert({ meta.rvaJumpTable, meta.rvaJumpTable + meta.sizeJumpTable * 4 });
 			mSwitchMeta.push_back(meta);
 			auto jumpTable = reinterpret_cast<const i32*>(mBytes.data() + meta.rvaJumpTable);
 			for (int i = 0; i < meta.sizeJumpTable; ++i)
@@ -340,7 +338,7 @@ private:
 				auto target = jumpTable[i];
 				log(LogLevel::Verbose, ">> branch {} = {:X}", i, target);
 				ensure(target >= mCurStart && target < mCurLimit);
-				mBlocks.edit(block).successors.push_back(target);
+				mBlocks[blockIndex].successors.push_back(target);
 				mPendingBlockStarts.push_back(target);
 			}
 			return true;
@@ -357,7 +355,6 @@ private:
 	i32 mCurLimit{};
 	std::vector<x86::Instruction> mInstructions;
 	RangeMap<FunctionBlock> mBlocks;
-	std::vector<FunctionBlock> mSwitchBlocks;
 	std::vector<SwitchMetadata> mSwitchMeta;
 	std::vector<i32> mPendingBlockStarts; // blocks to be analyzed
 	std::vector<i32> mPendingSwitches; // rvas of candidates to switch jumps

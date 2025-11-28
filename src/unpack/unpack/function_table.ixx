@@ -101,8 +101,7 @@ public:
 	}
 
 	// analyze single function that is assumed to be never analyzed before
-	// all the exception handlers are also analyzed automatically (but not stuff they call)
-	FunctionInfo& analyze(rva_t rva, std::string_view name, auto&& analyzeFunc)
+	FunctionInfo& analyze(rva_t rva, std::string_view name)
 	{
 		auto [it, isNew] = getOrCreateEntry(rva);
 		auto& e = it->second;
@@ -110,17 +109,28 @@ public:
 		logger(LogLevel::Verbose, "Processing {} function '{}' at {:X}...", isNew ? "new" : "known", name, rva);
 		e.name = name;
 
-		auto res = analyzeFunc(mFBA, rva, guessFunctionLimit(it), e.extraEntryPoints);
-		e.blocks = std::move(res.blocks);
-		e.instructions = std::move(res.instructions);
+		mFBA.start(rva, guessFunctionLimit(it));
+		mFBA.scheduleAndAnalyze(rva);
+		for (auto extra : e.extraEntryPoints)
+			mFBA.scheduleAndAnalyze(extra);
 
-		auto limit = e.seh ? e.seh->end : e.blocks.back().end;
-		if (e.type == FunctionType::SEHFilter && limit == e.blocks.back().end + 1)
+		auto limit = e.seh ? e.seh->end : mFBA.currentBlocks().back().end;
+		if (e.type == FunctionType::SEHFilter && limit == mFBA.currentBlocks().back().end + 1)
 		{
 			// TODO: for whatever reason, some SEH filters have SEH entry covering one byte more than is real...
 			--limit;
 			__debugbreak();
 		}
+
+		// note: new blocks are added during iteration, so index based iteration has to be used
+		for (int i = 0; i < mFBA.currentBlocks().size(); ++i)
+			if (auto next = guessNextUnreachableBlock(mFBA.currentBlocks()[i], i + 1 < mFBA.currentBlocks().size() ? mFBA.currentBlocks()[i + 1].begin : limit))
+				mFBA.scheduleAndAnalyze(next);
+
+		auto res = mFBA.finish();
+		e.blocks = std::move(res.blocks);
+		e.instructions = std::move(res.instructions);
+
 		mPatcher.patchFunction(e, limit);
 
 		e.refs = analysis::getSimpleRefs(e.instructions);
@@ -135,17 +145,6 @@ public:
 		}
 
 		return e;
-	}
-
-	auto& analyze(rva_t rva, std::string_view name)
-	{
-		return analyze(rva, name, [&](analysis::FunctionBlockAnalysis<>& analyzer, rva_t begin, rva_t limit, std::span<const rva_t> extraBlocks) {
-			analyzer.start(begin, limit);
-			analyzer.scheduleAndAnalyze(begin);
-			for (auto rva : extraBlocks)
-				analyzer.scheduleAndAnalyze(rva);
-			return analyzer.finish();
-		});
 	}
 
 	void analyzeSEHHandlers()
@@ -326,6 +325,31 @@ private:
 		ensure(!e.isAnalyzed());
 		e.type = type;
 		e.parent = parent;
+	}
+
+	// some functions have unreachable blocks that we still want to analyze; this uses some heuristics to try to guess one - returns rva of the start if found, or 0 otherwise
+	rva_t guessNextUnreachableBlock(const analysis::FunctionBlock& block, rva_t limit)
+	{
+		if (block.insCount() != 0)
+		{
+			auto& lastIns = mFBA.instructions(block).back();
+			if (lastIns.mnem == X86_INS_RET)
+				return 0; // assume nothing good after real ret
+			if (lastIns.mnem == X86_INS_JMP && lastIns.length == 1)
+				return 0; // assume everything that's in the jump chain is junk
+		}
+		auto rva = block.end;
+		while (rva < limit)
+		{
+			auto ins = x86::disasm(mBinary.bytes(), rva);
+			if (ins.mnem != X86_INS_NOP && ins.mnem != X86_INS_INT3)
+			{
+				logger(LogLevel::Important, "Found unreachable block at 0x{:X}, starting with {}", rva, ins);
+				return rva; // looks like a real block!
+			}
+			rva += ins.length;
+		}
+		return 0; // nope not found anything...
 	}
 
 private:

@@ -203,13 +203,7 @@ private:
 	void processBootstrapStart()
 	{
 		// note: bootstrap function is noreturn, and the very last block containing 'normal' return is unreachable
-		auto& func = mFuncTable.analyze(mBinary.entryPoint(), "bootstrapStart", [](auto& analyzer, rva_t start, rva_t limit, std::span<const rva_t> extraBlocks) {
-			ensure(extraBlocks.empty());
-			analyzer.start(start, limit);
-			analyzer.scheduleAndAnalyze(start);
-			//analyzer.scheduleAndAnalyze(analyzer.currentBlocks().back().end);
-			return analyzer.finish();
-		});
+		auto& func = mFuncTable.analyze(mBinary.entryPoint(), "bootstrapStart");
 
 		// we don't care about rdata refs here, these are error messages
 		resolveRefs(func.refs | std::views::filter([&](const auto& r) { return !sectionRData().contains(r.ref); }),
