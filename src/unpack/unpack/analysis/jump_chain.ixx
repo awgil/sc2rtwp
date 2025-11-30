@@ -381,13 +381,15 @@ export x86::Instruction disasmResolveJumpChains(std::span<const u8> imageBytes, 
 {
 	auto ins = x86::disasm(imageBytes, rva);
 	ensure(ins.length); // if disasm failed, we most likely fucked up with some jump chain detection
+	if (ins.prefix != x86::Prefix::none)
+		return ins; // don't fuck with prefixed instructions
 	// some notes:
 	// - sometimes jump chains start with effective nops, in that case we skip them here and pass first real instruction to the function we call
 	// - we do *not* skip actual nops - reason being that they are sometimes used to align jump chains
 	//   if we were to use them as jump chain starts, we might replace single-byte nop with a real jump, and then have some other block that jumps to the actual aligned jump chain start jump into the middle of instruction we create
 	if (const auto chainTarget = findJumpChainTarget(imageBytes, isEffectiveNop(ins) ? disasmNextNonNop(imageBytes, ins.endRVA(), {}) : ins))
 	{
-		ins = { rva, X86_INS_JMP, 1, 1, { x86::Operand{ chainTarget, 4 } } };
+		ins = { rva, X86_INS_JMP, 1, 1, x86::Prefix::none, { x86::Operand{ chainTarget, 4 } } };
 	}
 	return ins;
 }

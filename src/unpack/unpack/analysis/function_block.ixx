@@ -204,8 +204,9 @@ private:
 		{
 			auto& ins = mInstructions.emplace_back(disasmResolveJumpChains(mBytes, newBlock.end));
 			newBlock.end += ins.length;
-			if (ins.mnem == X86_INS_RET)
+			if (ins.mnem == X86_INS_RET || ins.mnem == X86_INS_INT3)
 			{
+				// it seems that compiler treats int3 as noreturn
 				// note: IDA treats int 0x29 (fastfail) as noreturn, but it seems there's code emitted after...
 				logIns(LogLevel::Verbose, ins, "ret");
 				break; // ret ends the final blocks of the function
@@ -353,7 +354,7 @@ private:
 				++iIns;
 				ensure(iIns != prevIns.rend());
 				ensure(iIns->mnem == X86_INS_CMP && (iIns->ops[0] == indexReg || iIns->ops[0] == x86::Reg::makeGPR32(indexReg.gprIndex())));
-				auto bound = getConstantOperandValue(iIns, prevIns.rend(), iIns->ops[1]);
+				auto bound = getConstantOperandValue(iIns, prevIns.rend(), iIns->ops[1], *pred);
 				if (meta.rvaIndirectTable)
 				{
 					// the size is actually of the indirect table
@@ -424,15 +425,42 @@ private:
 	}
 
 	// get constant value of the operand - if it's not an immediate, look back to see who writes it
-	i32 getConstantOperandValue(auto begin, auto end, const x86::Operand& op)
+	i32 getConstantOperandValue(auto begin, auto end, const x86::Operand& op, const FunctionBlock& block)
 	{
 		if (op.type == x86::OpType::Imm)
 			return op.immediate<i32>();
 		ensure(op.type == x86::OpType::Reg); // i guess it could also be a mem, nothing would really change in the logic?..
 		begin = findNextModifyingInstruction(begin, end, op.reg);
-		// TODO: support more generic renaming chains, look up predecessor blocks...
-		ensure(begin != end && begin->mnem == X86_INS_MOV && begin->ops[1].type == x86::OpType::Imm);
-		return begin->ops[1].immediate<i32>();
+		if (begin != end)
+		{
+			// TODO: support more generic renaming chains
+			ensure(begin->mnem == X86_INS_MOV && begin->ops[1].type == x86::OpType::Imm);
+			return begin->ops[1].immediate<i32>();
+		}
+
+		// ok we need to explore predecessor blocks...
+		PredecessorVisitor visitor{ mBlocks };
+		visitor.queuePredecessors(block);
+		while (auto pred = visitor.visitNext())
+		{
+			auto prevIns = instructions(*pred);
+			auto mod = findNextModifyingInstruction(prevIns.rbegin(), prevIns.rend(), op.reg);
+			if (mod != prevIns.rend())
+			{
+				// TODO: support more generic renaming chains
+				ensure(mod->mnem == X86_INS_MOV && mod->ops[1].type == x86::OpType::Imm);
+				return mod->ops[1].immediate<i32>();
+			}
+			else
+			{
+				// recurse...
+				visitor.queuePredecessors(*pred);
+			}
+		}
+
+		// nothing found?..
+		__debugbreak();
+		return 0;
 	}
 
 private:

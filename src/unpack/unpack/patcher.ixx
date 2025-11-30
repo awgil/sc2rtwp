@@ -62,7 +62,7 @@ public:
 		}
 
 		if (numPatchedJumps)
-			logger(LogLevel::Important, "Patched {} jumps", numPatchedJumps);
+			logger(LogLevel::Important, "Patched {} jumps in function {:X}", numPatchedJumps, func.blocks.front().begin);
 
 		// if a function uses AVX instructions, compiler aligns rbp to 0x20, so that it can then use aligned versions
 		// unfortunately hexrays really struggles with it

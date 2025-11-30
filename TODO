@@ -4,9 +4,8 @@
 - update to latest patch
 
 unpacker:
-- 0x15998E7: int3 treated as ret instead... right before switch jumptable
 - better switches
--- 0x189A76D, 0x189c600: again more weirdness...
+-- a few asserts...
 - entries for exports
 - patching instead of injection
 -- fix remapped section state checks

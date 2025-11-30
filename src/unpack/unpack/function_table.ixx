@@ -26,7 +26,7 @@ export struct FunctionInfo : analysis::Function
 	std::vector<analysis::Reference> refs;
 	const SEHInfo::Entry* seh = nullptr;
 	FunctionType type = FunctionType::Normal;
-	rva_t parent = 0; // relevant for special functions
+	std::vector<rva_t> parents; // relevant for special functions
 	std::vector<rva_t> extraEntryPoints;
 	std::vector<rva_t> exceptionHandlers; // note: external functions (eg. SEH filters, catch blocks, unwind funclets)
 
@@ -104,47 +104,13 @@ public:
 	FunctionInfo& analyze(rva_t rva, std::string_view name)
 	{
 		auto [it, isNew] = getOrCreateEntry(rva);
-		auto& e = it->second;
-		ensure(e.name.empty() && !e.isAnalyzed()); // should never have been analyzed before
 		logger(LogLevel::Verbose, "Processing {} function '{}' at {:X}...", isNew ? "new" : "known", name, rva);
-		e.name = name;
 
-		mFBA.start(rva, guessFunctionLimit(it));
-		mFBA.scheduleAndAnalyze(rva);
-		for (auto extra : e.extraEntryPoints)
-			mFBA.scheduleAndAnalyze(extra);
+		ensure(it->second.name.empty());
+		it->second.name = name;
 
-		auto limit = e.seh ? e.seh->end : mFBA.currentBlocks().back().end;
-		if (e.type == FunctionType::SEHFilter && limit == mFBA.currentBlocks().back().end + 1)
-		{
-			// TODO: for whatever reason, some SEH filters have SEH entry covering one byte more than is real...
-			--limit;
-			__debugbreak();
-		}
-
-		// note: new blocks are added during iteration, so index based iteration has to be used
-		for (int i = 0; i < mFBA.currentBlocks().size(); ++i)
-			if (auto next = guessNextUnreachableBlock(mFBA.currentBlocks()[i], i + 1 < mFBA.currentBlocks().size() ? mFBA.currentBlocks()[i + 1].begin : limit))
-				mFBA.scheduleAndAnalyze(next);
-
-		auto res = mFBA.finish();
-		e.blocks = std::move(res.blocks);
-		e.instructions = std::move(res.instructions);
-
-		mPatcher.patchFunction(e, limit);
-
-		e.refs = analysis::getSimpleRefs(e.instructions);
-
-		e.end = std::max(e.end, limit);
-		if (limit > e.end)
-		{
-			e.end = limit;
-			auto next = it;
-			++next;
-			ensure(next == mTable.end() || limit <= next->first);
-		}
-
-		return e;
+		executeAnalysis(it);
+		return it->second;
 	}
 
 	void analyzeSEHHandlers()
@@ -220,8 +186,11 @@ public:
 					for (auto& catchBlock : seh.value.catchBlocks(mBinary, tryBlock))
 					{
 						// catch blocks are implemented as separate functions that return address of the block to continue execution at
-						externalFuncs.push_back(catchBlock.dispOfHandler);
-						markAsSecondary(catchBlock.dispOfHandler, FunctionType::CatchBlock, seh.begin);
+						if (seh.begin != catchBlock.dispOfHandler)
+						{
+							externalFuncs.push_back(catchBlock.dispOfHandler);
+							markAsSecondary(catchBlock.dispOfHandler, FunctionType::CatchBlock, seh.begin);
+						}
 					}
 				}
 			}
@@ -240,54 +209,82 @@ public:
 
 	void analyzeAllRemaining()
 	{
-		std::vector<rva_t> pending, nextIteration;
-		pending.reserve(mTable.size());
-		for (auto& [_, func] : mTable)
-			if (!func.isAnalyzed())
-				pending.push_back(func.begin);
-
-		int iPass = 0;
-		while (!pending.empty())
+		// first, process all C++ catch blocks - unless they rethrow unconditionally, they will return an address of the extra entry point in the parent function
+		logger(LogLevel::Important, "Analyzing catch blocks");
+		int numAnalyzed = 0;
+		for (auto it = mTable.begin(); it != mTable.end(); ++it)
 		{
-			logger(LogLevel::Important, "Analyzing remaining functions: pass {}, {} functions remaining", ++iPass, pending.size());
-			for (size_t iFunc = 0; iFunc < pending.size(); ++iFunc)
+			if (it->second.type != FunctionType::CatchBlock)
+				continue;
+
+			++numAnalyzed;
+			executeAnalysis(it);
+			for (auto& ref : it->second.refs)
 			{
-				auto [it, isNew] = getOrCreateEntry(pending[iFunc]);
-				auto& entry = it->second;
-				ensure(!isNew && !entry.isAnalyzed());
-				auto needDefer = std::ranges::any_of(entry.exceptionHandlers, [&](rva_t secondary) {
-					auto& e = mTable[secondary];
-					return !e.isAnalyzed() && e.type == FunctionType::CatchBlock; // catch blocks need to be analyzed first, as they have extra block refs for parent func
-				});
-				if (needDefer)
-				{
-					nextIteration.push_back(pending[iFunc]);
-					continue;
-				}
+				if (ref.ref < mTextBegin || ref.ref >= mTextEnd)
+					continue; // not a code reference, don't care
 
-				analyze(it->first, "");
-				auto refs = std::span(entry.refs);
-				if (entry.type == FunctionType::CatchBlock)
+				if (ref.ins->mnem == X86_INS_LEA && ref.ins->ops[0] == x86::Reg::rax)
 				{
-					ensure(!refs.empty() && refs.back().ins->ops[0] == x86::Reg::rax);
-					auto& parent = mTable[entry.parent];
-					ensure(parent.begin == entry.parent && !parent.isAnalyzed());
-					parent.extraEntryPoints.push_back(refs.back().ref);
-					refs = refs.subspan(0, refs.size() - 1);
-				}
-
-				for (auto& ref : refs)
-				{
-					if (ref.ref >= mTextBegin && ref.ref < mTextEnd && getOrCreateEntry(ref.ref).second)
+					// note: catch blocks either rethrow or return rva to continue execution from, which is an extra entry point to one of the parents (the main one)
+					if (auto parent = findParentContainingAddress(it->second, ref.ref))
 					{
-						pending.push_back(ref.ref);
+						ensure(!parent->isAnalyzed());
+						parent->extraEntryPoints.push_back(ref.ref);
+						break;
 					}
 				}
-			}
 
-			pending.clear();
-			std::swap(pending, nextIteration);
+				// ensure we'll analyze this later
+				getOrCreateEntry(ref.ref);
+			}
 		}
+		logger(LogLevel::Important, "Analyzed {} catch blocks", numAnalyzed);
+
+		// ok, now main pass - analyze all functions known so far and any referenced we find
+		logger(LogLevel::Important, "Analyzing remaining functions");
+		std::vector<rva_t> nextIteration;
+		numAnalyzed = 0;
+		for (auto it = mTable.begin(); it != mTable.end(); ++it)
+		{
+			if (it->second.isAnalyzed())
+				continue;
+
+			++numAnalyzed;
+			executeAnalysis(it);
+			for (auto& ref : it->second.refs)
+			{
+				if (ref.ref < mTextBegin || ref.ref >= mTextEnd)
+					continue; // not a code reference, don't care
+
+				// ensure we'll analyze this later; note that it will automatically be iterated over on this pass if the address is greater than current function
+				if (getOrCreateEntry(ref.ref).second && ref.ref < it->first)
+					nextIteration.push_back(ref.ref);
+			}
+		}
+
+		while (!nextIteration.empty())
+		{
+			logger(LogLevel::Important, "Analyzing extra {} functions", nextIteration.size());
+			auto pending = std::move(nextIteration);
+			for (auto rva : pending)
+			{
+				++numAnalyzed;
+				auto it = mTable.find(rva);
+				ensure(it != mTable.end());
+				executeAnalysis(it);
+				for (auto& ref : it->second.refs)
+				{
+					if (ref.ref < mTextBegin || ref.ref >= mTextEnd)
+						continue; // not a code reference, don't care
+
+					if (getOrCreateEntry(ref.ref).second)
+						nextIteration.push_back(ref.ref);
+				}
+			}
+		}
+
+		logger(LogLevel::Important, "Analyzed {} functions", numAnalyzed);
 	}
 
 	const auto& entries() const { return mTable; }
@@ -311,6 +308,60 @@ private:
 		return std::make_pair(it, isNew);
 	}
 
+	auto markAsSecondary(rva_t rva, FunctionType type, rva_t parent)
+	{
+		// note: some catch blocks have themselves (???) or other catch blocks as parents
+		ensure(parent != rva);
+		auto& e = getOrCreateEntry(rva).first->second;
+		ensure(!e.isAnalyzed());
+		ensure(e.type == (e.parents.empty() ? FunctionType::Normal : type));
+		e.type = type;
+		if (!std::ranges::contains(e.parents, parent))
+			e.parents.push_back(parent);
+	}
+
+	void executeAnalysis(auto it)
+	{
+		auto& func = it->second;
+		ensure(!func.isAnalyzed()); // should never have been analyzed before
+		mFBA.start(func.begin, guessFunctionLimit(it));
+		mFBA.scheduleAndAnalyze(func.begin);
+		for (auto extra : func.extraEntryPoints)
+			mFBA.scheduleAndAnalyze(extra);
+
+		auto limit = func.seh ? func.seh->end : mFBA.currentBlocks().back().end;
+		if (limit == mFBA.currentBlocks().back().end + 1)
+		{
+			// note: for whatever reason, few functions have SEH entry covering one byte more than is real...
+			--limit;
+		}
+
+		// note: new blocks are added during iteration, so index based iteration has to be used
+		for (int i = 0; i < mFBA.currentBlocks().size() - 1; ++i)
+			if (auto next = guessNextUnreachableBlock(mFBA.currentBlocks()[i], mFBA.currentBlocks()[i + 1].begin))
+				mFBA.scheduleAndAnalyze(next);
+		// and see if there's some unreachable tail...
+		if (func.seh && limit > mFBA.currentBlocks().back().end)
+			if (auto next = guessNextUnreachableBlock(mFBA.currentBlocks().back(), limit))
+				mFBA.scheduleAndAnalyze(next);
+
+		auto res = mFBA.finish();
+		func.blocks = std::move(res.blocks);
+		func.instructions = std::move(res.instructions);
+
+		mPatcher.patchFunction(func, limit);
+
+		func.refs = analysis::getSimpleRefs(func.instructions);
+
+		if (limit > func.end)
+		{
+			func.end = limit;
+			auto next = it;
+			++next;
+			ensure(next == mTable.end() || limit <= next->first);
+		}
+	}
+
 	auto guessFunctionLimit(auto it)
 	{
 		if (it->second.seh)
@@ -319,22 +370,12 @@ private:
 		return it != mTable.end() ? it->first : mTextEnd;
 	}
 
-	auto markAsSecondary(rva_t rva, FunctionType type, rva_t parent)
-	{
-		auto& e = getOrCreateEntry(rva).first->second;
-		ensure(!e.isAnalyzed());
-		e.type = type;
-		e.parent = parent;
-	}
-
 	// some functions have unreachable blocks that we still want to analyze; this uses some heuristics to try to guess one - returns rva of the start if found, or 0 otherwise
 	rva_t guessNextUnreachableBlock(const analysis::FunctionBlock& block, rva_t limit)
 	{
 		if (block.insCount() != 0)
 		{
 			auto& lastIns = mFBA.instructions(block).back();
-			if (lastIns.mnem == X86_INS_RET)
-				return 0; // assume nothing good after real ret
 			if (lastIns.mnem == X86_INS_JMP && lastIns.length == 1)
 				return 0; // assume everything that's in the jump chain is junk
 		}
@@ -350,6 +391,17 @@ private:
 			rva += ins.length;
 		}
 		return 0; // nope not found anything...
+	}
+
+	FunctionInfo* findParentContainingAddress(const FunctionInfo& function, rva_t rva)
+	{
+		for (auto p : function.parents)
+		{
+			auto& parent = mTable[p];
+			if (rva >= parent.begin && rva < parent.end)
+				return &parent;
+		}
+		return nullptr;
 	}
 
 private:

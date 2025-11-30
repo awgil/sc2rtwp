@@ -249,6 +249,7 @@ export Instruction disasm(std::span<const u8> code, i32 offset, i32 codeStart = 
 		result.mnem = static_cast<x86_insn>(insn.id);
 		result.length = insn.size;
 		result.opcount = detail.x86.op_count;
+		result.prefix = static_cast<Prefix>(detail.x86.prefix[0]);
 		ensure(result.opcount <= result.ops.size());
 		for (int i = 0; auto& op : result.operands())
 		{

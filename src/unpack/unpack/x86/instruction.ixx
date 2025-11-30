@@ -11,6 +11,14 @@ export import unpack.x86.operand;
 
 namespace x86 {
 
+export enum class Prefix : u8
+{
+	none = 0,
+	lock = 0xF0,
+	repnz = 0xF2,
+	repz = 0xF3,
+};
+
 export struct Mnem
 {
 	using Value = x86_insn;
@@ -86,6 +94,7 @@ export struct Instruction
 	Mnem mnem;
 	u8 length;
 	u8 opcount;
+	Prefix prefix; // group 1 (lock/repeat) only
 	std::array<Operand, 4> ops;
 
 	i32 endRVA() const { return rva + length; }
@@ -96,6 +105,12 @@ export struct Instruction
 
 // formatters
 using namespace x86;
+
+export template<> struct std::formatter<Prefix>
+{
+	constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+	auto format(const Prefix& obj, format_context& ctx) const { return ranges::copy(rfl::enum_to_string(obj), ctx.out()).out; }
+};
 
 export template<> struct std::formatter<Mnem>
 {
@@ -109,6 +124,8 @@ export template<> struct std::formatter<Instruction>
 
 	auto format(const Instruction& obj, format_context& ctx) const
 	{
+		if (obj.prefix != Prefix::none)
+			format_to(ctx.out(), "{} ", obj.prefix);
 		format_to(ctx.out(), "{}", obj.mnem);
 		for (int i = 0; auto& op : obj.operands())
 		{

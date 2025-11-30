@@ -57,11 +57,16 @@
   </Type>
 
   <Type Name="x86::Instruction">
-    <DisplayString Condition="opcount == 0">{rva,x}: {mnem}</DisplayString>
-    <DisplayString Condition="opcount == 1">{rva,x}: {mnem} {ops[0]}</DisplayString>
-    <DisplayString Condition="opcount == 2">{rva,x}: {mnem} {ops[0]}, {ops[1]}</DisplayString>
-    <DisplayString Condition="opcount == 3">{rva,x}: {mnem} {ops[0]}, {ops[1]}, {ops[2]}</DisplayString>
-    <DisplayString Condition="opcount == 4">{rva,x}: {mnem} {ops[0]}, {ops[1]}, {ops[2]}, {ops[3]}</DisplayString>
+    <DisplayString Condition="prefix == Prefix::none &amp;&amp; opcount == 0">{rva,x}: {mnem}</DisplayString>
+    <DisplayString Condition="prefix == Prefix::none &amp;&amp; opcount == 1">{rva,x}: {mnem} {ops[0]}</DisplayString>
+    <DisplayString Condition="prefix == Prefix::none &amp;&amp; opcount == 2">{rva,x}: {mnem} {ops[0]}, {ops[1]}</DisplayString>
+    <DisplayString Condition="prefix == Prefix::none &amp;&amp; opcount == 3">{rva,x}: {mnem} {ops[0]}, {ops[1]}, {ops[2]}</DisplayString>
+    <DisplayString Condition="prefix == Prefix::none &amp;&amp; opcount == 4">{rva,x}: {mnem} {ops[0]}, {ops[1]}, {ops[2]}, {ops[3]}</DisplayString>
+    <DisplayString Condition="prefix != Prefix::none &amp;&amp; opcount == 0">{rva,x}: {prefix,en} {mnem}</DisplayString>
+    <DisplayString Condition="prefix != Prefix::none &amp;&amp; opcount == 1">{rva,x}: {prefix,en} {mnem} {ops[0]}</DisplayString>
+    <DisplayString Condition="prefix != Prefix::none &amp;&amp; opcount == 2">{rva,x}: {prefix,en} {mnem} {ops[0]}, {ops[1]}</DisplayString>
+    <DisplayString Condition="prefix != Prefix::none &amp;&amp; opcount == 3">{rva,x}: {prefix,en} {mnem} {ops[0]}, {ops[1]}, {ops[2]}</DisplayString>
+    <DisplayString Condition="prefix != Prefix::none &amp;&amp; opcount == 4">{rva,x}: {prefix,en} {mnem} {ops[0]}, {ops[1]}, {ops[2]}, {ops[3]}</DisplayString>
   </Type>
 
 </AutoVisualizer>
