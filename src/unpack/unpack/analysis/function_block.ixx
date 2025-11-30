@@ -38,6 +38,44 @@ enum class LogLevel { None, Important, Verbose };
 Logger log{ "FuncBlock", LogLevel::None };
 void logIns(LogLevel level, const x86::Instruction& ins, std::string_view message) { log(level, ">> {:X}: {} = {}", ins.rva, ins, message); }
 
+// utility for exploring predecessors recursively in breadth-first order, for finding switch index bounds
+// we prefer breadth-first order, since bounds are likely to be checked close to the switch...
+class PredecessorVisitor
+{
+public:
+	PredecessorVisitor(const RangeMap<FunctionBlock>& blocks)
+		: mBlocks(blocks)
+		, mQueued(blocks.size())
+	{
+	}
+
+	void queuePredecessors(const FunctionBlock& block)
+	{
+		for (int i = 0; i < mBlocks.size(); ++i)
+		{
+			if (!mQueued[i] && std::ranges::contains(mBlocks[i].successors, block.begin))
+			{
+				mQueued[i] = true;
+				mQueue.push_back(i);
+			}
+		}
+	}
+
+	const FunctionBlock* visitNext()
+	{
+		if (mNextToVisit < mQueue.size())
+			return &mBlocks[mQueue[mNextToVisit++]];
+		else
+			return nullptr;
+	}
+
+private:
+	const RangeMap<FunctionBlock>& mBlocks;
+	std::vector<int> mQueue;
+	int mNextToVisit = 0;
+	std::vector<bool> mQueued;
+};
+
 // utility for finding all blocks in a function
 // consider reusing the instance of this class for analyzing multiple functions, to save on some allocations
 export template<typename Func = Function> requires std::is_base_of_v<Function, Func>
@@ -300,11 +338,12 @@ private:
 		// finally, find the jump table size - one of the predecessor blocks should have a jcc
 		// note that some predecessors could set the case variable to a constant guaranteed to be in range and skip the bounds check!
 		auto blockStart = mBlocks[blockIndex].begin;
-		auto predecessors = findPredecessors(blockStart);
-		for (const FunctionBlock& b : predecessors)
+		PredecessorVisitor visitor{ mBlocks };
+		visitor.queuePredecessors(mBlocks[blockIndex]);
+		while (auto pred = visitor.visitNext())
 		{
-			log(LogLevel::Verbose, ">> considering predecessor {:X}", b.begin);
-			auto prevIns = instructions(b);
+			log(LogLevel::Verbose, ">> considering predecessor {:X}", pred->begin);
+			auto prevIns = instructions(*pred);
 			iIns = prevIns.rbegin();
 			ensure(iIns != prevIns.rend()); // block with no instructions can't be a predecessor...
 			if (iIns->mnem == X86_INS_JBE || iIns->mnem == X86_INS_JA) // TODO: can it be something else, like jb?
@@ -330,14 +369,20 @@ private:
 					log(LogLevel::Verbose, ">> found direct switch at [{:X}] {:X}: jump table at {:X}, size {}", blockStart, rva, meta.rvaJumpTable, meta.sizeJumpTable);
 				}
 			}
-			else if (iIns->mnem == X86_INS_JMP && iIns->ops[0].type == x86::OpType::Reg)
+			//else if (iIns->mnem == X86_INS_JMP && iIns->ops[0].type == x86::OpType::Reg)
+			//{
+			//	// nested switch on the same variable, this is cursed...
+			//	ensure(!meta.rvaIndirectTable); // only direct
+			//	auto parentSwitch = std::ranges::find_if(mSwitchMeta, [&](const auto& meta) { return meta.rvaJmp == iIns->rva; });
+			//	ensure(parentSwitch != mSwitchMeta.end() && !parentSwitch->rvaIndirectTable);
+			//	log(LogLevel::Verbose, ">> found nested direct-direct switch at [{:X}] {:X}, parent at {:X}", blockStart, rva, parentSwitch->rvaJmp);
+			//	meta.sizeJumpTable = parentSwitch->sizeJumpTable;
+			//}
+			else if (findNextModifyingInstruction(iIns, prevIns.rend(), indexReg, x86::Reg::makeGPR32(indexReg.gprIndex())) == prevIns.rend())
 			{
-				// nested switch on the same variable, this is cursed...
-				ensure(!meta.rvaIndirectTable); // only direct
-				auto parentSwitch = std::ranges::find_if(mSwitchMeta, [&](const auto& meta) { return meta.rvaJmp == iIns->rva; });
-				ensure(parentSwitch != mSwitchMeta.end() && !parentSwitch->rvaIndirectTable);
-				log(LogLevel::Verbose, ">> found nested direct-direct switch at [{:X}] {:X}, parent at {:X}", blockStart, rva, parentSwitch->rvaJmp);
-				meta.sizeJumpTable = parentSwitch->sizeJumpTable;
+				// this block doesn't touch index, so look in predecessors
+				visitor.queuePredecessors(*pred);
+				continue;
 			}
 			else
 			{
@@ -362,15 +407,6 @@ private:
 		// we didn't find the good predecessor...
 		__debugbreak();
 		return false;
-	}
-
-	auto findPredecessors(i32 blockStart) const
-	{
-		std::vector<std::reference_wrapper<const FunctionBlock>> result;
-		for (auto& b : mBlocks)
-			if (std::ranges::contains(b.successors, blockStart))
-				result.emplace_back(b);
-		return result;
 	}
 
 	// find next instruction that writes a value to one of the specified registers
@@ -409,28 +445,5 @@ private:
 	std::vector<i32> mPendingBlockStarts; // blocks to be analyzed
 	std::vector<i32> mPendingSwitches; // rvas of candidates to switch jumps
 };
-
-// utility for exploring predecessors recursively in breadth-first order, for finding switch index bounds
-// we prefer breadth-first order, since bounds are likely to be checked close to the switch...
-//class PredecessorVisitor
-//{
-//public:
-//	PredecessorVisitor(const RangeMap<FunctionBlock>& blocks)
-//		: mBlocks(blocks)
-//		, mQueued(blocks.size())
-//	{
-//	}
-//
-//	void queuePredecessors(const FunctionBlock& block)
-//	{
-//		auto start = 
-//	}
-//
-//private:
-//	const RangeMap<FunctionBlock>& mBlocks;
-//	std::vector<int> mQueue;
-//	int mNextToVisit = 0;
-//	std::vector<bool> mQueued;
-//};
 
 }
