@@ -4,12 +4,13 @@
 - update to latest patch
 
 unpacker:
-- better switches
--- a few asserts...
 - entries for exports
 - patching instead of injection
 -- fix remapped section state checks
 - print out when antidebug stuff is found
 - seh: analyze unwind funclets?
-- ida interop improvement - automatically import structs and sync to idb...
+- ida interop improvement
+-- automatically import structs and sync to idb...
 -- seh filters are marked as chunks of owning functions...
+-- seh-end creates a function entry containing junk
+-- detect functions that ida found but unpacker did not - and investigate

@@ -297,26 +297,31 @@ private:
 			log(LogLevel::Verbose, ">> not found 'add jumptable, imagebase'");
 			return false; // not a switch statement
 		}
-		ensure(iIns->ops[1].type == x86::OpType::Reg);
+		ensure(iIns->ops[0] == branchReg && iIns->ops[1].type == x86::OpType::Reg);
 		auto imagebaseReg = iIns->ops[1].reg; // note: imagebase and branch could be swapped
 		ensure(imagebaseReg.isGPR64());
 
 		// find mov that loads case RVA from jump table - it's always mov reg32_jpt, [reg64_imagebase + 4 * reg64_index + imm_rva]
-		// TODO: theoretically there could be a mov that changes the register we're looking for...
-		iIns = findNextModifyingInstruction(iIns, blockIns.rend(), x86::Reg::makeGPR32(branchReg.gprIndex()), x86::Reg::makeGPR32(imagebaseReg.gprIndex()));
-		ensure(iIns != blockIns.rend() && iIns->mnem == X86_INS_MOV && iIns->ops[1].type == x86::OpType::Mem && iIns->ops[1].mem.scale == 4);
-		auto indexReg = iIns->ops[1].mem.index;
-		if (iIns->ops[1].mem.base != imagebaseReg)
+		// note: theoretically there could be a mov that changes the register we're looking for...
+		iIns = findNextModifyingInstruction(iIns, blockIns.rend(), branchReg, imagebaseReg);
+		if (iIns != blockIns.rend() && iIns->mnem == X86_INS_LEA)
 		{
-			ensure(iIns->ops[1].mem.base == branchReg);
-			std::swap(branchReg, imagebaseReg);
+			ensure(iIns->ops[1] == x86::OpMem{ .base = x86::Reg::imagebase, .scale = 1 });
+			ensure(iIns->ops[0] == branchReg || iIns->ops[0] == imagebaseReg);
+			// we've found lea reg, imagebase - the other register is the jpt, then - continue looking
+			iIns = findNextModifyingInstruction(iIns, blockIns.rend(), iIns->ops[0] == branchReg ? imagebaseReg : branchReg);
 		}
+		ensure(iIns != blockIns.rend() && iIns->mnem == X86_INS_MOV && iIns->ops[1].type == x86::OpType::Mem && iIns->ops[1].mem.scale == 4);
+		imagebaseReg = iIns->ops[1].mem.base;
+		auto indexReg = iIns->ops[1].mem.index;
 		meta.rvaJumpTable = iIns->ops[1].mem.displacement;
 
 		// now look for optional indirect table load: movzx index32, byte [imagebase + indirect + indirectTableRVA]
 		// also look for any index renames
-		while (iIns = findNextModifyingInstruction(iIns, blockIns.rend(), x86::Reg::makeGPR32(indexReg.gprIndex()), indexReg), iIns != blockIns.rend())
+		const x86::OpMem* indexValue = nullptr;
+		while (iIns = findNextModifyingInstruction(iIns, blockIns.rend(), indexReg), iIns != blockIns.rend())
 		{
+			ensure(!indexValue);
 			if (iIns->mnem == X86_INS_MOVZX && iIns->ops[1].type == x86::OpType::Mem)
 			{
 				ensure(iIns->ops[0] == x86::Reg::makeGPR32(indexReg.gprIndex()));
@@ -329,6 +334,12 @@ private:
 			{
 				ensure((iIns->ops[0] == indexReg || iIns->ops[0] == x86::Reg::makeGPR32(indexReg.gprIndex())) && iIns->ops[1].type == x86::OpType::Reg && iIns->ops[1].reg.isGPR32Or64());
 				indexReg = iIns->ops[1].reg; // TODO: or should it be converted to reg64?..
+			}
+			else if (iIns->mnem == X86_INS_LEA)
+			{
+				// we have lea index, [...]; save the expression, so we can check it's used for comparison later
+				ensure(iIns->ops[1].type == x86::OpType::Mem);
+				indexValue = &iIns->ops[1].mem;
 			}
 			else
 			{
@@ -352,8 +363,22 @@ private:
 				// this is what we're looking for - the block that checks switch variable against limit
 				ensure(iIns->ops[0].type == x86::OpType::Imm);
 				++iIns;
-				ensure(iIns != prevIns.rend());
-				ensure(iIns->mnem == X86_INS_CMP && (iIns->ops[0] == indexReg || iIns->ops[0] == x86::Reg::makeGPR32(indexReg.gprIndex())));
+				ensure(iIns != prevIns.rend() && iIns->mnem == X86_INS_CMP);
+				if (!isOperandGPR32Or64(iIns->ops[0], indexReg))
+				{
+					ensure(!indexValue);
+					// comparison and index are different registers - verify that they hold identical value
+					auto modIns = findNextModifyingInstructionWithPredecessors(iIns, prevIns.rend(), *pred, iIns->ops[0].reg, indexReg);
+					ensure(modIns && modIns->mnem == X86_INS_MOV);
+					ensure(modIns->ops[1].type == x86::OpType::Reg && modIns->ops[1].reg.isGPR32Or64());
+					auto expectedSrc = isOperandGPR32Or64(modIns->ops[0], indexReg) ? iIns->ops[0].reg : indexReg;
+					ensure(isOperandGPR32Or64(modIns->ops[1], expectedSrc));
+				}
+				if (indexValue)
+				{
+					auto modIns = findNextModifyingInstructionWithPredecessors(iIns, prevIns.rend(), *pred, indexReg);
+					ensure(modIns && modIns->mnem == X86_INS_LEA && modIns->ops[1] == *indexValue);
+				}
 				auto bound = getConstantOperandValue(iIns, prevIns.rend(), iIns->ops[1], *pred);
 				if (meta.rvaIndirectTable)
 				{
@@ -370,16 +395,7 @@ private:
 					log(LogLevel::Verbose, ">> found direct switch at [{:X}] {:X}: jump table at {:X}, size {}", blockStart, rva, meta.rvaJumpTable, meta.sizeJumpTable);
 				}
 			}
-			//else if (iIns->mnem == X86_INS_JMP && iIns->ops[0].type == x86::OpType::Reg)
-			//{
-			//	// nested switch on the same variable, this is cursed...
-			//	ensure(!meta.rvaIndirectTable); // only direct
-			//	auto parentSwitch = std::ranges::find_if(mSwitchMeta, [&](const auto& meta) { return meta.rvaJmp == iIns->rva; });
-			//	ensure(parentSwitch != mSwitchMeta.end() && !parentSwitch->rvaIndirectTable);
-			//	log(LogLevel::Verbose, ">> found nested direct-direct switch at [{:X}] {:X}, parent at {:X}", blockStart, rva, parentSwitch->rvaJmp);
-			//	meta.sizeJumpTable = parentSwitch->sizeJumpTable;
-			//}
-			else if (findNextModifyingInstruction(iIns, prevIns.rend(), indexReg, x86::Reg::makeGPR32(indexReg.gprIndex())) == prevIns.rend())
+			else if (findNextModifyingInstruction(iIns, prevIns.rend(), indexReg) == prevIns.rend())
 			{
 				// this block doesn't touch index, so look in predecessors
 				visitor.queuePredecessors(*pred);
@@ -410,33 +426,32 @@ private:
 		return false;
 	}
 
+	static bool isOperandGPR32Or64(const x86::Operand& op, x86::Reg reg)
+	{
+		ensure(reg.isGPR32Or64());
+		return op.type == x86::OpType::Reg && op.reg.isGPR32Or64() && op.reg.gprIndex() == reg.gprIndex();
+	}
+
 	// find next instruction that writes a value to one of the specified registers
 	auto findNextModifyingInstruction(auto begin, auto end, auto... regs)
 	{
+		ensure((regs.isGPR32Or64() && ...));
 		while (++begin != end)
 		{
-			if (((begin->ops[0] != regs) && ...))
-				continue; // this instruction can't affect the register we're looking for, skip...
-			// TODO: mov reg, r2 => continue looking at who writes to r2...
 			// TODO: skip test/cmp ?
-			break;
+			if ((isOperandGPR32Or64(begin->ops[0], regs) || ...))
+				break; // ok this affects one of the registers we're looking for
 		}
 		return begin;
 	}
 
-	// get constant value of the operand - if it's not an immediate, look back to see who writes it
-	i32 getConstantOperandValue(auto begin, auto end, const x86::Operand& op, const FunctionBlock& block)
+	// as above, except that also explore predecessors if needed
+	const x86::Instruction* findNextModifyingInstructionWithPredecessors(auto begin, auto end, const FunctionBlock& block, auto... regs)
 	{
-		if (op.type == x86::OpType::Imm)
-			return op.immediate<i32>();
-		ensure(op.type == x86::OpType::Reg); // i guess it could also be a mem, nothing would really change in the logic?..
-		begin = findNextModifyingInstruction(begin, end, op.reg);
+		// TODO: support renaming chains?..
+		begin = findNextModifyingInstruction(begin, end, regs...);
 		if (begin != end)
-		{
-			// TODO: support more generic renaming chains
-			ensure(begin->mnem == X86_INS_MOV && begin->ops[1].type == x86::OpType::Imm);
-			return begin->ops[1].immediate<i32>();
-		}
+			return &*begin;
 
 		// ok we need to explore predecessor blocks...
 		PredecessorVisitor visitor{ mBlocks };
@@ -444,12 +459,11 @@ private:
 		while (auto pred = visitor.visitNext())
 		{
 			auto prevIns = instructions(*pred);
-			auto mod = findNextModifyingInstruction(prevIns.rbegin(), prevIns.rend(), op.reg);
+			auto mod = findNextModifyingInstruction(prevIns.rbegin(), prevIns.rend(), regs...);
 			if (mod != prevIns.rend())
 			{
-				// TODO: support more generic renaming chains
-				ensure(mod->mnem == X86_INS_MOV && mod->ops[1].type == x86::OpType::Imm);
-				return mod->ops[1].immediate<i32>();
+				// TODO: ensure all paths from here to original block converges?..
+				return &*mod;
 			}
 			else
 			{
@@ -458,9 +472,19 @@ private:
 			}
 		}
 
-		// nothing found?..
-		__debugbreak();
-		return 0;
+		// not found
+		return nullptr;
+	}
+
+	// get constant value of the operand - if it's not an immediate, look back to see who writes it
+	i32 getConstantOperandValue(auto begin, auto end, const x86::Operand& op, const FunctionBlock& block)
+	{
+		if (op.type == x86::OpType::Imm)
+			return op.immediate<i32>();
+		ensure(op.type == x86::OpType::Reg); // i guess it could also be a mem, nothing would really change in the logic?..
+		auto ins = findNextModifyingInstructionWithPredecessors(begin, end, block, op.reg);
+		ensure(ins && ins->mnem == X86_INS_MOV && ins->ops[1].type == x86::OpType::Imm);
+		return ins->ops[1].immediate<i32>();
 	}
 
 private:
